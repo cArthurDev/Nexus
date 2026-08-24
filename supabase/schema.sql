@@ -76,7 +76,7 @@ CREATE TABLE public.messages (
 );
 
 -- 7. MENSAGENS DIRETAS (DMs)
-CREATE TABLE public.direct_messages (
+CREATE TABLE IF NOT EXISTS public.direct_messages (
   id TEXT PRIMARY KEY,
   sender_id TEXT NOT NULL,
   receiver_id TEXT NOT NULL,
@@ -87,13 +87,27 @@ CREATE TABLE public.direct_messages (
   created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
 );
 
--- 8. DESATIVAR RLS PARA ACESSO IMEDIATO
+-- 8. SESSÕES DE VOZ ATIVAS
+CREATE TABLE IF NOT EXISTS public.voice_sessions (
+  user_id TEXT PRIMARY KEY,
+  channel_id TEXT NOT NULL,
+  is_muted BOOLEAN DEFAULT FALSE,
+  is_deafened BOOLEAN DEFAULT FALSE,
+  is_speaking BOOLEAN DEFAULT FALSE,
+  is_camera_on BOOLEAN DEFAULT FALSE,
+  is_screen_sharing BOOLEAN DEFAULT FALSE,
+  joined_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- 9. DESATIVAR RLS PARA ACESSO IMEDIATO
 ALTER TABLE public.profiles DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.servers DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.categories DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.channels DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.messages DISABLE ROW LEVEL SECURITY;
 ALTER TABLE public.direct_messages DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.voice_sessions DISABLE ROW LEVEL SECURITY;
 
 -- 9. INSERIR O SERVIDOR PADRÃO E CANAIS INICIAIS ABERTOS
 INSERT INTO public.servers (id, name, icon_url, description, owner_id, invite_code)

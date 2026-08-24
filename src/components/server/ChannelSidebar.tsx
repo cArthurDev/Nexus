@@ -55,9 +55,8 @@ export const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
   };
 
   const handleChannelClick = (channel: Channel) => {
-    if (channel.type === 'TEXT') {
-      setActiveChannelId(channel.id);
-    } else if (channel.type === 'VOICE') {
+    setActiveChannelId(channel.id);
+    if (channel.type === 'VOICE') {
       joinVoiceChannel(channel.id, channel.name, activeServer.name);
     }
   };

@@ -67,7 +67,6 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
-  // Keep localStreamRef synced
   useEffect(() => {
     localStreamRef.current = localStream;
   }, [localStream]);
@@ -110,7 +109,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           sum += buffer[i];
         }
         const average = sum / buffer.length;
-        const speakingNow = average > 10;
+        const speakingNow = average > 8;
 
         setIsSpeaking(speakingNow);
 
@@ -205,11 +204,10 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return pc;
   }, [currentUser]);
 
-  // Supabase Presence & WebRTC Signaling Channel (runs ONLY when activeVoiceChannelId or currentUser.id changes)
+  // Supabase Presence & WebRTC Signaling Channel
   useEffect(() => {
     if (!activeVoiceChannelId || !currentUser || !isSupabaseConfigured || !supabase) return;
 
-    // Unique channel identifier
     const channelName = `voice_room_${activeVoiceChannelId}`;
     const channel = supabase.channel(channelName, {
       config: {
@@ -264,6 +262,20 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           }
         }
       })
+      .on('broadcast', { event: 'PEER_STATE' }, (payload: any) => {
+        const p = payload.payload?.participant as VoiceParticipant;
+        if (p && p.user_id !== currentUser.id) {
+          setRemoteParticipants(prev => {
+            const index = prev.findIndex(item => item.user_id === p.user_id);
+            if (index >= 0) {
+              const updated = [...prev];
+              updated[index] = { ...updated[index], ...p };
+              return updated;
+            }
+            return [...prev, p];
+          });
+        }
+      })
       .on('presence', { event: 'sync' }, async () => {
         const state = channel.presenceState();
         const remotes: VoiceParticipant[] = [];
@@ -273,7 +285,10 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const presenceList = state[key] as any[];
             if (presenceList && presenceList.length > 0) {
               const latest = presenceList[presenceList.length - 1];
-              remotes.push(latest.participant);
+              const p = (latest.participant || latest) as VoiceParticipant;
+              if (p && p.user_id) {
+                remotes.push(p);
+              }
             }
           }
         });
@@ -301,27 +316,30 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       })
       .on('presence', { event: 'join' }, async ({ key, newPresences }) => {
         if (key !== currentUser.id && newPresences.length > 0) {
-          const p = (newPresences[0] as any).participant;
-          setRemoteParticipants(prev => {
-            if (prev.some(item => item.user_id === p.user_id)) return prev;
-            return [...prev, p];
-          });
-          sounds.playJoinVoice();
-
-          if (currentUser.id < p.user_id && !peerConnectionsRef.current.has(p.user_id)) {
-            const pc = createPeerConnection(p.user_id, channel);
-            const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-            await pc.setLocalDescription(offer);
-
-            channel.send({
-              type: 'broadcast',
-              event: 'WEBRTC_OFFER',
-              payload: {
-                from: currentUser.id,
-                to: p.user_id,
-                offer,
-              },
+          const latest = newPresences[0] as any;
+          const p = (latest.participant || latest) as VoiceParticipant;
+          if (p && p.user_id) {
+            setRemoteParticipants(prev => {
+              if (prev.some(item => item.user_id === p.user_id)) return prev;
+              return [...prev, p];
             });
+            sounds.playJoinVoice();
+
+            if (currentUser.id < p.user_id && !peerConnectionsRef.current.has(p.user_id)) {
+              const pc = createPeerConnection(p.user_id, channel);
+              const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+              await pc.setLocalDescription(offer);
+
+              channel.send({
+                type: 'broadcast',
+                event: 'WEBRTC_OFFER',
+                payload: {
+                  from: currentUser.id,
+                  to: p.user_id,
+                  offer,
+                },
+              });
+            }
           }
         }
       })
@@ -346,20 +364,26 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // 2. Subscribe once
     channel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
-        await channel.track({
-          participant: {
-            id: `vp_${currentUser.id}`,
-            user_id: currentUser.id,
-            channel_id: activeVoiceChannelId,
-            is_muted: isMuted,
-            is_deafened: isDeafened,
-            is_speaking: isSpeaking,
-            is_camera_on: isCameraOn,
-            is_screen_sharing: isScreenSharing,
-            audio_level: isSpeaking ? 80 : 0,
-            joined_at: new Date().toISOString(),
-            profile: currentUser,
-          },
+        const myData = {
+          id: `vp_${currentUser.id}`,
+          user_id: currentUser.id,
+          channel_id: activeVoiceChannelId,
+          is_muted: isMuted,
+          is_deafened: isDeafened,
+          is_speaking: isSpeaking,
+          is_camera_on: isCameraOn,
+          is_screen_sharing: isScreenSharing,
+          audio_level: isSpeaking ? 80 : 0,
+          joined_at: new Date().toISOString(),
+          profile: currentUser,
+        };
+
+        await channel.track(myData);
+
+        channel.send({
+          type: 'broadcast',
+          event: 'PEER_STATE',
+          payload: { participant: myData }
         });
       }
     });
@@ -376,21 +400,27 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   // Update presence state when local mic/cam/screen changes
   useEffect(() => {
     if (realtimeChannelRef.current && currentUser && activeVoiceChannelId) {
-      realtimeChannelRef.current.track({
-        participant: {
-          id: `vp_${currentUser.id}`,
-          user_id: currentUser.id,
-          channel_id: activeVoiceChannelId,
-          is_muted: isMuted,
-          is_deafened: isDeafened,
-          is_speaking: isSpeaking,
-          is_camera_on: isCameraOn,
-          is_screen_sharing: isScreenSharing,
-          audio_level: isSpeaking ? 80 : 0,
-          joined_at: new Date().toISOString(),
-          profile: currentUser,
-        },
-      }).catch(() => {});
+      const myData = {
+        id: `vp_${currentUser.id}`,
+        user_id: currentUser.id,
+        channel_id: activeVoiceChannelId,
+        is_muted: isMuted,
+        is_deafened: isDeafened,
+        is_speaking: isSpeaking,
+        is_camera_on: isCameraOn,
+        is_screen_sharing: isScreenSharing,
+        audio_level: isSpeaking ? 80 : 0,
+        joined_at: new Date().toISOString(),
+        profile: currentUser,
+      };
+
+      realtimeChannelRef.current.track(myData).catch(() => {});
+
+      realtimeChannelRef.current.send({
+        type: 'broadcast',
+        event: 'PEER_STATE',
+        payload: { participant: myData }
+      });
     }
   }, [isMuted, isDeafened, isSpeaking, isCameraOn, isScreenSharing, currentUser, activeVoiceChannelId]);
 
