@@ -18,6 +18,8 @@ interface VoiceContextType {
   localStream: MediaStream | null;
   screenStream: MediaStream | null;
   spotlightUserId: string | null;
+  allVoiceSessions: Record<string, VoiceParticipant[]>;
+  getChannelParticipants: (channelId: string) => VoiceParticipant[];
   joinVoiceChannel: (channelId: string, channelName: string, serverName?: string) => Promise<void>;
   leaveVoiceChannel: () => void;
   toggleMute: () => void;
@@ -39,12 +41,17 @@ const RTC_CONFIG: RTCConfiguration = {
 };
 
 export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { currentUser } = useAuth();
+  const { currentUser, allUsers } = useAuth();
   const currentUserRef = useRef<UserProfile | null>(currentUser);
+  const allUsersRef = useRef<UserProfile[]>(allUsers);
 
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+
+  useEffect(() => {
+    allUsersRef.current = allUsers;
+  }, [allUsers]);
 
   const [activeVoiceChannelId, setActiveVoiceChannelId] = useState<string | null>(null);
   const [activeVoiceChannelName, setActiveVoiceChannelName] = useState<string | null>(null);
@@ -61,6 +68,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
 
   const [remoteParticipants, setRemoteParticipants] = useState<VoiceParticipant[]>([]);
+  const [allVoiceSessions, setAllVoiceSessions] = useState<Record<string, VoiceParticipant[]>>({});
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -68,6 +76,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const realtimeChannelRef = useRef<any>(null);
+  const globalVoiceChannelRef = useRef<any>(null);
   
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -75,6 +84,84 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   useEffect(() => {
     localStreamRef.current = localStream;
   }, [localStream]);
+
+  // 1. Fetch all active voice sessions across the platform from Supabase
+  const fetchGlobalVoiceSessions = useCallback(async () => {
+    if (!isSupabaseConfigured || !supabase) return;
+    try {
+      const { data: sessions, error } = await supabase
+        .from('voice_sessions')
+        .select('*');
+
+      if (sessions && !error) {
+        const grouped: Record<string, VoiceParticipant[]> = {};
+        sessions.forEach(sess => {
+          const foundProfile = allUsersRef.current.find(u => u.id === sess.user_id);
+          const profile: UserProfile = foundProfile || ((currentUserRef.current?.id === sess.user_id && currentUserRef.current) ? currentUserRef.current : {
+            id: sess.user_id,
+            username: sess.user_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
+            display_name: sess.user_id.includes('cArthurDev') ? 'cArthurDev' : 'Usuário',
+            avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${sess.user_id}`,
+            presence_status: 'online',
+            created_at: sess.joined_at,
+          });
+
+          const participant: VoiceParticipant = {
+            id: `vp_${sess.user_id}`,
+            user_id: sess.user_id,
+            channel_id: sess.channel_id,
+            is_muted: sess.is_muted,
+            is_deafened: sess.is_deafened,
+            is_speaking: sess.is_speaking,
+            is_camera_on: sess.is_camera_on,
+            is_screen_sharing: sess.is_screen_sharing,
+            audio_level: sess.is_speaking ? 80 : 0,
+            joined_at: sess.joined_at,
+            profile,
+          };
+
+          if (!grouped[sess.channel_id]) {
+            grouped[sess.channel_id] = [];
+          }
+          grouped[sess.channel_id].push(participant);
+        });
+
+        setAllVoiceSessions(grouped);
+      }
+    } catch (e) {
+      console.warn('Error fetching global voice sessions', e);
+    }
+  }, []);
+
+  // Global Realtime voice presence listener + background polling (every 2.5s)
+  useEffect(() => {
+    fetchGlobalVoiceSessions();
+
+    if (isSupabaseConfigured && supabase) {
+      const globalChannel = supabase
+        .channel('global:voice_activity')
+        .on('broadcast', { event: 'VOICE_SYNC' }, () => {
+          fetchGlobalVoiceSessions();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'voice_sessions' }, () => {
+          fetchGlobalVoiceSessions();
+        })
+        .subscribe();
+
+      globalVoiceChannelRef.current = globalChannel;
+
+      const interval = setInterval(() => {
+        fetchGlobalVoiceSessions();
+      }, 2500);
+
+      return () => {
+        clearInterval(interval);
+        if (supabase) {
+          supabase.removeChannel(globalChannel);
+        }
+      };
+    }
+  }, [fetchGlobalVoiceSessions]);
 
   const setupAudioDetection = useCallback((stream: MediaStream) => {
     try {
@@ -139,7 +226,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setIsSpeaking(false);
   }, []);
 
-  // WebRTC Peer Connection Helper (100% stable, uses refs)
+  // WebRTC Peer Connection Helper
   const createPeerConnection = useCallback((remoteUserId: string, channel: any) => {
     if (peerConnectionsRef.current.has(remoteUserId)) {
       return peerConnectionsRef.current.get(remoteUserId)!;
@@ -213,7 +300,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return pc;
   }, []);
 
-  // Supabase Presence & WebRTC Signaling Channel (runs ONLY when activeVoiceChannelId changes!)
+  // Supabase Presence & WebRTC Signaling Channel (runs ONLY when activeVoiceChannelId changes)
   useEffect(() => {
     const user = currentUserRef.current;
     if (!activeVoiceChannelId || !user || !isSupabaseConfigured || !supabase) return;
@@ -230,7 +317,6 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     realtimeChannelRef.current = channel;
 
-    // 1. Attach ALL callbacks BEFORE calling subscribe()
     channel
       .on('broadcast', { event: 'WEBRTC_OFFER' }, async (payload: any) => {
         const { from, to, offer } = payload.payload;
@@ -372,7 +458,6 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
       });
 
-    // 2. Subscribe once
     channel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
         const myData = {
@@ -408,10 +493,10 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
   }, [activeVoiceChannelId, createPeerConnection]);
 
-  // Update presence state & broadcast when local mic/cam/screen changes without restarting channel
+  // Update presence state & database session when local mic/cam/screen changes
   useEffect(() => {
     const user = currentUserRef.current;
-    if (realtimeChannelRef.current && user && activeVoiceChannelId) {
+    if (user && activeVoiceChannelId && isSupabaseConfigured && supabase) {
       const myData = {
         id: `vp_${user.id}`,
         user_id: user.id,
@@ -426,12 +511,33 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         profile: user,
       };
 
-      realtimeChannelRef.current.track(myData).catch(() => {});
+      if (realtimeChannelRef.current) {
+        realtimeChannelRef.current.track(myData).catch(() => {});
+        realtimeChannelRef.current.send({
+          type: 'broadcast',
+          event: 'PEER_STATE',
+          payload: { participant: myData }
+        });
+      }
 
-      realtimeChannelRef.current.send({
-        type: 'broadcast',
-        event: 'PEER_STATE',
-        payload: { participant: myData }
+      // Upsert into Supabase voice_sessions table
+      supabase.from('voice_sessions').upsert({
+        user_id: user.id,
+        channel_id: activeVoiceChannelId,
+        is_muted: isMuted,
+        is_deafened: isDeafened,
+        is_speaking: isSpeaking,
+        is_camera_on: isCameraOn,
+        is_screen_sharing: isScreenSharing,
+        updated_at: new Date().toISOString()
+      }).then(() => {
+        if (globalVoiceChannelRef.current) {
+          globalVoiceChannelRef.current.send({
+            type: 'broadcast',
+            event: 'VOICE_SYNC',
+            payload: { updated: true }
+          });
+        }
       });
     }
   }, [isMuted, isDeafened, isSpeaking, isCameraOn, isScreenSharing, activeVoiceChannelId]);
@@ -447,6 +553,30 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     sounds.playJoinVoice();
 
+    // Persist join in Supabase voice_sessions
+    if (currentUser && isSupabaseConfigured && supabase) {
+      supabase.from('voice_sessions').upsert({
+        user_id: currentUser.id,
+        channel_id: channelId,
+        is_muted: isMuted,
+        is_deafened: isDeafened,
+        is_speaking: false,
+        is_camera_on: false,
+        is_screen_sharing: false,
+        joined_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }).then(() => {
+        if (globalVoiceChannelRef.current) {
+          globalVoiceChannelRef.current.send({
+            type: 'broadcast',
+            event: 'VOICE_SYNC',
+            payload: { user_id: currentUser.id, channel_id: channelId }
+          });
+        }
+        fetchGlobalVoiceSessions();
+      });
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -460,7 +590,6 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setLocalStream(stream);
       setupAudioDetection(stream);
 
-      // Add audio tracks to existing peer connections
       peerConnectionsRef.current.forEach(pc => {
         stream.getTracks().forEach(track => {
           pc.addTrack(track, stream);
@@ -479,11 +608,23 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     sounds.playLeaveVoice();
     stopAudioDetection();
 
-    // Close all WebRTC Peer Connections
+    // Remove from Supabase voice_sessions
+    if (currentUser && isSupabaseConfigured && supabase) {
+      supabase.from('voice_sessions').delete().eq('user_id', currentUser.id).then(() => {
+        if (globalVoiceChannelRef.current) {
+          globalVoiceChannelRef.current.send({
+            type: 'broadcast',
+            event: 'VOICE_SYNC',
+            payload: { user_id: currentUser.id }
+          });
+        }
+        fetchGlobalVoiceSessions();
+      });
+    }
+
     peerConnectionsRef.current.forEach((pc) => pc.close());
     peerConnectionsRef.current.clear();
 
-    // Stop and clear all remote audio players
     remoteAudioElementsRef.current.forEach((audio) => {
       audio.srcObject = null;
     });
@@ -623,7 +764,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       try {
         const captureStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
-          audio: true
+          audio: false
         });
 
         const screenTrack = captureStream.getVideoTracks()[0];
@@ -694,6 +835,13 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     screenStream
   ]);
 
+  const getChannelParticipants = useCallback((channelId: string): VoiceParticipant[] => {
+    if (activeVoiceChannelId === channelId && allParticipants.length > 0) {
+      return allParticipants;
+    }
+    return allVoiceSessions[channelId] || [];
+  }, [activeVoiceChannelId, allParticipants, allVoiceSessions]);
+
   return (
     <VoiceContext.Provider
       value={{
@@ -710,6 +858,8 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         localStream,
         screenStream,
         spotlightUserId,
+        allVoiceSessions,
+        getChannelParticipants,
         joinVoiceChannel,
         leaveVoiceChannel,
         toggleMute,

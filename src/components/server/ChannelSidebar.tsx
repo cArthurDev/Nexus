@@ -40,6 +40,7 @@ export const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
     isInVoice,
     leaveVoiceChannel,
     joinVoiceChannel,
+    getChannelParticipants,
     participants,
     isSpeaking
   } = useVoice();
@@ -223,7 +224,7 @@ export const ChannelSidebar: React.FC<ChannelSidebarProps> = ({
     const isCurrentVoice = !isText && activeVoiceChannelId === channel.id;
 
     // If it's a voice channel, check participants in it
-    const channelParticipants = !isText && activeVoiceChannelId === channel.id ? participants : [];
+    const channelParticipants = !isText ? getChannelParticipants(channel.id) : [];
 
     return (
       <div key={channel.id} className="space-y-1">
