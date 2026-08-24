@@ -1,32 +1,43 @@
-# React + TypeScript + Vite
+# Nexus ⚡
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Plataforma moderna de comunicação em tempo real com servidores, canais de texto, canais de voz com WebRTC (áudio, vídeo e compartilhamento de tela com detecção de fala em tempo real), mensagens diretas e sistema de amigos.
 
-Currently, two official plugins are available:
+---
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 🚀 Tecnologias
 
-## React Compiler
+- **Frontend**: React 19 + TypeScript + Vite
+- **Estilização**: Tailwind CSS (Dark Mode, Glassmorphism, Micro-interações)
+- **Banco de Dados & Auth**: Supabase + PostgreSQL
+- **Tempo Real**: Supabase Realtime (WebSockets)
+- **Áudio, Vídeo & Tela**: WebRTC + Web Audio API (VAD - Voice Activity Detection)
+- **Ícones**: Lucide React
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the Oxlint configuration
+## 🛠️ Como Executar
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+1. **Instalar dependências**:
+   ```bash
+   npm install
+   ```
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
+2. **Configurar variáveis de ambiente**:
+   Crie um arquivo `.env` na raiz:
+   ```env
+   VITE_SUPABASE_URL=https://seu-projeto.supabase.co
+   VITE_SUPABASE_ANON_KEY=sua-chave-publicavel
+   ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+3. **Executar o script SQL no Supabase**:
+   Execute o conteúdo de `supabase/schema.sql` no SQL Editor do Supabase.
+
+4. **Iniciar o servidor de desenvolvimento**:
+   ```bash
+   npm run dev
+   ```
+
+5. **Build para Produção / Deploy (Vercel)**:
+   ```bash
+   npm run build
+   ```
