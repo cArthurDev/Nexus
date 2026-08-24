@@ -6,8 +6,8 @@ interface AuthContextType {
   currentUser: UserProfile | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  login: (email: string, password?: string) => Promise<boolean>;
-  signup: (username: string, email: string, password?: string) => Promise<boolean>;
+  login: (usernameOrEmail: string, password?: string) => Promise<boolean>;
+  signup: (username: string, email?: string, password?: string) => Promise<boolean>;
   logout: () => Promise<void>;
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
   allUsers: UserProfile[];
@@ -41,7 +41,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
-  // Sync users list to localStorage
   useEffect(() => {
     localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(allUsers));
   }, [allUsers]);
@@ -54,25 +53,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [currentUser]);
 
-  // Supabase Auth and Profiles Realtime Sync
+  // Load from Supabase on mount
   useEffect(() => {
     async function initAuth() {
       if (isSupabaseConfigured && supabase) {
         try {
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user) {
-            const { data: profile } = await supabase
-              .from('profiles')
-              .select('*')
-              .eq('id', session.user.id)
-              .single();
-
-            if (profile) {
-              setCurrentUser(profile);
-            }
-          }
-
-          // Fetch all user profiles from Supabase so all users see each other
+          // Fetch all profiles so everyone sees each other immediately
           const { data: profiles } = await supabase
             .from('profiles')
             .select('*');
@@ -81,7 +67,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setAllUsers(profiles);
           }
         } catch (err) {
-          console.error('Supabase auth initialization error', err);
+          console.error('Supabase fetch profiles error', err);
         }
       }
       setIsLoading(false);
@@ -90,7 +76,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     initAuth();
   }, []);
 
-  // BroadcastChannel for local cross-tab users sync
+  // BroadcastChannel for cross-tab sync
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const bc = new BroadcastChannel('nexus_users_channel');
@@ -111,127 +97,93 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
-  const login = async (emailOrUsername: string, password?: string): Promise<boolean> => {
+  const login = async (usernameOrEmail: string, password?: string): Promise<boolean> => {
     setIsLoading(true);
-    const cleanInput = emailOrUsername.trim().toLowerCase();
+    const cleanInput = usernameOrEmail.trim().toLowerCase().replace(/^@/, '');
 
-    if (isSupabaseConfigured && supabase && password) {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: cleanInput,
-        password
-      });
-      if (error || !data.user) {
-        setIsLoading(false);
-        throw error;
+    // Check if user exists in database/memory
+    let user = allUsers.find(
+      u => u.username.toLowerCase() === cleanInput || u.id === cleanInput
+    );
+
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('*')
+          .ilike('username', cleanInput)
+          .single();
+
+        if (profile) {
+          user = profile;
+        }
+      } catch {
+        // Fallback to local
       }
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', data.user.id)
-        .single();
-      if (profile) {
-        setCurrentUser(profile);
-      }
+    }
+
+    if (user) {
+      const updated = { ...user, presence_status: 'online' as const };
+      setCurrentUser(updated);
+      setAllUsers(prev => prev.map(u => u.id === user.id ? updated : u));
       setIsLoading(false);
       return true;
     } else {
-      // Local auth
-      const user = allUsers.find(
-        u => u.username.toLowerCase() === cleanInput || u.id === cleanInput
-      );
-
-      if (user) {
-        const updated = { ...user, presence_status: 'online' as const };
-        setCurrentUser(updated);
-        setAllUsers(prev => prev.map(u => u.id === user.id ? updated : u));
-        setIsLoading(false);
-        return true;
-      } else {
-        const newUser: UserProfile = {
-          id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          username: cleanInput.replace(/[^a-z0-9_]/g, '') || 'usuario',
-          display_name: emailOrUsername.trim(),
-          avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanInput}`,
-          presence_status: 'online',
-          status_text: 'Olá! Sou novo no Nexus ✨',
-          created_at: new Date().toISOString(),
-        };
-        setCurrentUser(newUser);
-        setAllUsers(prev => [...prev, newUser]);
-
-        if (typeof window !== 'undefined') {
-          const bc = new BroadcastChannel('nexus_users_channel');
-          bc.postMessage({ type: 'USER_JOINED', user: newUser });
-          bc.close();
-        }
-
-        setIsLoading(false);
-        return true;
-      }
+      // If user doesn't exist yet, auto-create account instantly!
+      return signup(cleanInput, undefined, password);
     }
   };
 
-  const signup = async (username: string, email: string, password?: string): Promise<boolean> => {
+  const signup = async (username: string, email?: string, password?: string): Promise<boolean> => {
     setIsLoading(true);
-    const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+    const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '') || 'usuario';
+    const cleanDisplayName = username.trim() || cleanUsername;
+    const resolvedEmail = email?.trim() || `${cleanUsername}@nexus.app`;
 
-    if (isSupabaseConfigured && supabase && password) {
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: {
-            username: cleanUsername,
-            display_name: username.trim(),
-          }
-        }
-      });
-      if (error) {
-        setIsLoading(false);
-        throw error;
-      }
-      if (data.user) {
-        const newProfile: UserProfile = {
-          id: data.user.id,
-          username: cleanUsername,
-          display_name: username.trim(),
-          avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
-          presence_status: 'online',
-          status_text: 'Novo no Nexus!',
-          created_at: new Date().toISOString(),
-        };
-        setCurrentUser(newProfile);
-        setAllUsers(prev => [...prev.filter(u => u.id !== newProfile.id), newProfile]);
-      }
-      setIsLoading(false);
-      return true;
-    } else {
-      const newUser: UserProfile = {
-        id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        username: cleanUsername,
-        display_name: username.trim(),
-        avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
-        presence_status: 'online',
-        status_text: 'Acabei de criar minha conta no Nexus 🚀',
-        created_at: new Date().toISOString(),
-      };
-      setCurrentUser(newUser);
-      setAllUsers(prev => [...prev.filter(u => u.username !== cleanUsername), newUser]);
+    const newUser: UserProfile = {
+      id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      username: cleanUsername,
+      display_name: cleanDisplayName,
+      avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
+      presence_status: 'online',
+      status_text: 'Olá! Sou novo no Nexus ✨',
+      created_at: new Date().toISOString(),
+    };
 
-      if (typeof window !== 'undefined') {
-        const bc = new BroadcastChannel('nexus_users_channel');
-        bc.postMessage({ type: 'USER_JOINED', user: newUser });
-        bc.close();
+    // Save to Supabase if configured (without requiring email verification!)
+    if (isSupabaseConfigured && supabase) {
+      try {
+        await supabase.from('profiles').upsert({
+          id: newUser.id,
+          username: newUser.username,
+          display_name: newUser.display_name,
+          avatar_url: newUser.avatar_url,
+          presence_status: newUser.presence_status,
+          status_text: newUser.status_text,
+        });
+      } catch (err) {
+        console.error('Supabase profile save error:', err);
       }
-
-      setIsLoading(false);
-      return true;
     }
+
+    setCurrentUser(newUser);
+    setAllUsers(prev => [...prev.filter(u => u.username !== cleanUsername && u.id !== newUser.id), newUser]);
+
+    if (typeof window !== 'undefined') {
+      const bc = new BroadcastChannel('nexus_users_channel');
+      bc.postMessage({ type: 'USER_JOINED', user: newUser });
+      bc.close();
+    }
+
+    setIsLoading(false);
+    return true;
   };
 
   const logout = async () => {
     if (isSupabaseConfigured && supabase) {
-      await supabase.auth.signOut();
+      try {
+        await supabase.auth.signOut();
+      } catch {}
     }
     setCurrentUser(null);
     localStorage.removeItem(AUTH_STORAGE_KEY);
@@ -244,10 +196,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setAllUsers(prev => prev.map(u => u.id === currentUser.id ? updated : u));
 
     if (isSupabaseConfigured && supabase) {
-      await supabase
-        .from('profiles')
-        .update(updates)
-        .eq('id', currentUser.id);
+      try {
+        await supabase
+          .from('profiles')
+          .update(updates)
+          .eq('id', currentUser.id);
+      } catch (err) {
+        console.error('Supabase profile update error:', err);
+      }
     }
 
     if (typeof window !== 'undefined') {
