@@ -14,13 +14,11 @@ import {
 interface UserSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onOpenAuth: () => void;
 }
 
 export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   isOpen,
   onClose,
-  onOpenAuth,
 }) => {
   const { currentUser, updateProfile, logout } = useAuth();
   const { showToast } = useToast();
@@ -84,7 +82,6 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const handleLogout = async () => {
     await logout();
     onClose();
-    onOpenAuth();
   };
 
   return (

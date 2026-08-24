@@ -23,7 +23,6 @@ import { CreateCategoryModal } from './components/modals/CreateCategoryModal';
 import { InviteModal } from './components/modals/InviteModal';
 import { UserSettingsModal } from './components/modals/UserSettingsModal';
 import { ServerSettingsModal } from './components/modals/ServerSettingsModal';
-import { AuthModal } from './components/modals/AuthModal';
 
 import { Menu, X, Radio, Plus, Sparkles } from 'lucide-react';
 
@@ -201,7 +200,6 @@ const MainLayout: React.FC = () => {
       <UserSettingsModal
         isOpen={showUserSettings}
         onClose={() => setShowUserSettings(false)}
-        onOpenAuth={() => setShowAuthModal(true)}
       />
 
       <ServerSettingsModal
@@ -209,10 +207,6 @@ const MainLayout: React.FC = () => {
         onClose={() => setShowServerSettings(false)}
       />
 
-      <AuthModal
-        isOpen={showAuthModal}
-        onClose={() => setShowAuthModal(false)}
-      />
     </div>
   );
 };

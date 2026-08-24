@@ -6,8 +6,8 @@ interface AuthContextType {
   currentUser: UserProfile | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  login: (usernameOrEmail: string, password?: string) => Promise<boolean>;
-  signup: (username: string, email?: string, password?: string) => Promise<boolean>;
+  login: (emailOrUsername: string, password?: string) => Promise<boolean>;
+  signup: (username: string, email: string, password?: string) => Promise<boolean>;
   logout: () => Promise<void>;
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
   allUsers: UserProfile[];
@@ -29,7 +29,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed && parsed.id && !parsed.id.startsWith('usr_me_01')) {
+        if (parsed && parsed.id) {
           return parsed;
         }
       } catch (e) {
@@ -53,138 +53,168 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [currentUser]);
 
-  // Load from Supabase on mount
+  // 1. Fetch all user profiles from Supabase and subscribe to changes
   useEffect(() => {
-    async function initAuth() {
+    async function loadAllProfiles() {
       if (isSupabaseConfigured && supabase) {
         try {
-          // Fetch all profiles so everyone sees each other immediately
-          const { data: profiles } = await supabase
+          const { data: profiles, error } = await supabase
             .from('profiles')
             .select('*');
 
-          if (profiles && profiles.length > 0) {
+          if (profiles && !error && profiles.length > 0) {
             setAllUsers(profiles);
           }
         } catch (err) {
-          console.error('Supabase fetch profiles error', err);
+          console.error('Error loading Supabase profiles:', err);
         }
       }
       setIsLoading(false);
     }
 
-    initAuth();
+    loadAllProfiles();
+
+    // Supabase Realtime subscription for all user profiles
+    if (isSupabaseConfigured && supabase) {
+      const profileChannel = supabase
+        .channel('public:profiles_realtime')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'profiles' },
+          (payload) => {
+            if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
+              const updatedProfile = payload.new as UserProfile;
+              setAllUsers(prev => {
+                const filtered = prev.filter(u => u.id !== updatedProfile.id && u.username !== updatedProfile.username);
+                return [...filtered, updatedProfile];
+              });
+            }
+          }
+        )
+        .subscribe();
+
+      return () => {
+        if (supabase) supabase.removeChannel(profileChannel);
+      };
+    }
   }, []);
 
-  // BroadcastChannel for cross-tab sync
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const bc = new BroadcastChannel('nexus_users_channel');
-
-    bc.onmessage = (e) => {
-      const data = e.data;
-      if (data.type === 'USER_JOINED' || data.type === 'USER_UPDATED') {
-        const user: UserProfile = data.user;
-        setAllUsers(prev => {
-          const filtered = prev.filter(u => u.id !== user.id && u.username !== user.username);
-          return [...filtered, user];
-        });
-      }
-    };
-
-    return () => {
-      bc.close();
-    };
-  }, []);
-
-  const login = async (usernameOrEmail: string, password?: string): Promise<boolean> => {
+  const login = async (emailOrUsername: string, password?: string): Promise<boolean> => {
     setIsLoading(true);
-    const cleanInput = usernameOrEmail.trim().toLowerCase().replace(/^@/, '');
+    const cleanInput = emailOrUsername.trim().toLowerCase();
 
-    // Check if user exists in database/memory
-    let user = allUsers.find(
-      u => u.username.toLowerCase() === cleanInput || u.id === cleanInput
-    );
-
+    // 1. Query Supabase directly
     if (isSupabaseConfigured && supabase) {
       try {
-        const { data: profile } = await supabase
+        const { data: usersByUsername } = await supabase
           .from('profiles')
           .select('*')
-          .ilike('username', cleanInput)
-          .single();
+          .eq('username', cleanInput);
 
-        if (profile) {
-          user = profile;
+        const { data: usersByEmail } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('email', cleanInput);
+
+        const users = (usersByUsername && usersByUsername.length > 0) 
+          ? usersByUsername 
+          : (usersByEmail && usersByEmail.length > 0 ? usersByEmail : []);
+
+        if (users.length > 0) {
+          const targetUser = users[0];
+          if (password && targetUser.password && targetUser.password !== password) {
+            setIsLoading(false);
+            throw new Error('Senha incorreta.');
+          }
+
+          const updated = { ...targetUser, presence_status: 'online' as const };
+          setCurrentUser(updated);
+          setAllUsers(prev => {
+            const filtered = prev.filter(u => u.id !== updated.id);
+            return [...filtered, updated];
+          });
+          setIsLoading(false);
+          return true;
         }
-      } catch {
-        // Fallback to local
+      } catch (err: unknown) {
+        if (err instanceof Error && err.message === 'Senha incorreta.') {
+          setIsLoading(false);
+          throw err;
+        }
+        console.warn('Supabase login check:', err);
       }
     }
 
-    if (user) {
-      const updated = { ...user, presence_status: 'online' as const };
+    // 2. Local memory fallback
+    const localUser = allUsers.find(
+      u => u.username.toLowerCase() === cleanInput || (u as any).email?.toLowerCase() === cleanInput
+    );
+
+    if (localUser) {
+      if (password && (localUser as any).password && (localUser as any).password !== password) {
+        setIsLoading(false);
+        throw new Error('Senha incorreta.');
+      }
+      const updated = { ...localUser, presence_status: 'online' as const };
       setCurrentUser(updated);
-      setAllUsers(prev => prev.map(u => u.id === user.id ? updated : u));
       setIsLoading(false);
       return true;
-    } else {
-      // If user doesn't exist yet, auto-create account instantly!
-      return signup(cleanInput, undefined, password);
     }
+
+    setIsLoading(false);
+    throw new Error('Usuário ou E-mail não encontrado. Crie sua conta na aba "Criar Conta".');
   };
 
-  const signup = async (username: string, email?: string, password?: string): Promise<boolean> => {
+  const signup = async (username: string, email: string, password?: string): Promise<boolean> => {
     setIsLoading(true);
     const cleanUsername = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '') || 'usuario';
     const cleanDisplayName = username.trim() || cleanUsername;
-    const resolvedEmail = email?.trim() || `${cleanUsername}@nexus.app`;
+    const cleanEmail = email.trim().toLowerCase();
 
-    const newUser: UserProfile = {
-      id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    const newUserId = cleanUsername === 'carthurdev' ? 'usr_cArthurDev' : `usr_${cleanUsername}_${Date.now().toString(36)}`;
+
+    const newProfile: UserProfile & { email?: string; password?: string } = {
+      id: newUserId,
       username: cleanUsername,
       display_name: cleanDisplayName,
+      email: cleanEmail,
+      password: password || '',
       avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
       presence_status: 'online',
-      status_text: 'Olá! Sou novo no Nexus ✨',
+      status_text: 'Olá! Estou no Nexus 🚀',
       created_at: new Date().toISOString(),
     };
 
-    // Save to Supabase if configured (without requiring email verification!)
+    // Save directly to Supabase profiles table without requiring any email confirmation!
     if (isSupabaseConfigured && supabase) {
       try {
-        await supabase.from('profiles').upsert({
-          id: newUser.id,
-          username: newUser.username,
-          display_name: newUser.display_name,
-          avatar_url: newUser.avatar_url,
-          presence_status: newUser.presence_status,
-          status_text: newUser.status_text,
+        const { error } = await supabase.from('profiles').upsert({
+          id: newProfile.id,
+          username: newProfile.username,
+          display_name: newProfile.display_name,
+          email: newProfile.email,
+          password: newProfile.password,
+          avatar_url: newProfile.avatar_url,
+          presence_status: newProfile.presence_status,
+          status_text: newProfile.status_text,
         });
+
+        if (error) {
+          console.error('Supabase profile creation error:', error);
+        }
       } catch (err) {
-        console.error('Supabase profile save error:', err);
+        console.error('Supabase profile creation catch:', err);
       }
     }
 
-    setCurrentUser(newUser);
-    setAllUsers(prev => [...prev.filter(u => u.username !== cleanUsername && u.id !== newUser.id), newUser]);
-
-    if (typeof window !== 'undefined') {
-      const bc = new BroadcastChannel('nexus_users_channel');
-      bc.postMessage({ type: 'USER_JOINED', user: newUser });
-      bc.close();
-    }
+    setCurrentUser(newProfile);
+    setAllUsers(prev => [...prev.filter(u => u.username !== cleanUsername && u.id !== newProfile.id), newProfile]);
 
     setIsLoading(false);
     return true;
   };
 
   const logout = async () => {
-    if (isSupabaseConfigured && supabase) {
-      try {
-        await supabase.auth.signOut();
-      } catch {}
-    }
     setCurrentUser(null);
     localStorage.removeItem(AUTH_STORAGE_KEY);
   };
@@ -204,12 +234,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } catch (err) {
         console.error('Supabase profile update error:', err);
       }
-    }
-
-    if (typeof window !== 'undefined') {
-      const bc = new BroadcastChannel('nexus_users_channel');
-      bc.postMessage({ type: 'USER_UPDATED', user: updated });
-      bc.close();
     }
   };
 
