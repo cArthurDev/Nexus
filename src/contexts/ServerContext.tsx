@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import type { Server, Channel, Category, Message, ServerMember, MessageAttachment, ChannelType, UserRole } from '../types';
 import { useAuth } from './AuthContext';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
@@ -32,10 +32,6 @@ interface ServerContextType {
 }
 
 const ServerContext = createContext<ServerContextType | undefined>(undefined);
-
-const GLOBAL_SERVERS_REGISTRY = 'nexus_global_servers_registry';
-const GLOBAL_CHANNELS_REGISTRY = 'nexus_global_channels_registry';
-const GLOBAL_CATEGORIES_REGISTRY = 'nexus_global_categories_registry';
 
 // Default initial open server for everyone
 const DEFAULT_MAIN_SERVER: Server = {
@@ -125,8 +121,9 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [activeChannelId, setActiveChannelId] = useState<string | null>(serverChannels[0]?.id || DEFAULT_TEXT_CHAN.id);
 
   const [typingUsers, setTypingUsers] = useState<{ username: string; display_name: string; timestamp: number }[]>([]);
+  const supabaseRealtimeChannelRef = useRef<any>(null);
 
-  // 1. Fetch ALL open servers from Supabase
+  // 1. Fetch servers, categories, and channels from Supabase
   useEffect(() => {
     async function loadAllOpenServers() {
       if (isSupabaseConfigured && supabase) {
@@ -147,7 +144,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const { data: chanList } = await supabase.from('channels').select('*');
             if (chanList && chanList.length > 0) setChannels(chanList);
           } else {
-            // Seed main server into Supabase if empty
+            // Seed main server
             await supabase.from('servers').upsert({
               id: DEFAULT_MAIN_SERVER.id,
               name: DEFAULT_MAIN_SERVER.name,
@@ -193,89 +190,86 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     loadAllOpenServers();
   }, [currentUser]);
 
-  // 2. Fetch message history for active channel
-  useEffect(() => {
-    async function loadChannelMessages() {
-      if (!activeChannelId) return;
+  // 2. Fetch messages function (used on mount & interval sync)
+  const fetchMessagesFromSupabase = useCallback(async (chanId: string) => {
+    if (!chanId || !isSupabaseConfigured || !supabase) return;
+    try {
+      const { data: msgs, error } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('channel_id', chanId)
+        .order('created_at', { ascending: true });
 
-      if (isSupabaseConfigured && supabase) {
-        try {
-          const { data: msgs, error } = await supabase
-            .from('messages')
-            .select('*')
-            .eq('channel_id', activeChannelId)
-            .order('created_at', { ascending: true });
+      if (msgs && !error) {
+        const formatted: Message[] = msgs.map(m => {
+          const authorProfile = allUsers.find(u => u.id === m.author_id) || {
+            id: m.author_id,
+            username: m.author_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
+            display_name: m.author_id.includes('cArthurDev') ? 'cArthurDev' : 'Usuário',
+            avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${m.author_id}`,
+            presence_status: 'online',
+            created_at: m.created_at,
+          };
+          return {
+            ...m,
+            author: authorProfile,
+          };
+        });
 
-          if (msgs && !error) {
-            const formatted: Message[] = msgs.map(m => {
-              const authorProfile = allUsers.find(u => u.id === m.author_id) || {
-                id: m.author_id,
-                username: m.author_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
-                display_name: m.author_id.includes('cArthurDev') ? 'cArthurDev (Dono)' : 'Usuário',
-                avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${m.author_id}`,
-                presence_status: 'online',
-                created_at: m.created_at,
-              };
-              return {
-                ...m,
-                author: authorProfile,
-              };
-            });
-
-            setAllMessages(prev => ({
-              ...prev,
-              [activeChannelId]: formatted
-            }));
-          }
-        } catch (err) {
-          console.error('Error loading channel messages:', err);
-        }
+        setAllMessages(prev => ({
+          ...prev,
+          [chanId]: formatted
+        }));
       }
+    } catch (err) {
+      console.error('Error loading channel messages:', err);
     }
+  }, [allUsers]);
 
-    loadChannelMessages();
-  }, [activeChannelId, allUsers]);
+  // Fetch when activeChannelId changes
+  useEffect(() => {
+    if (activeChannelId) {
+      fetchMessagesFromSupabase(activeChannelId);
+    }
+  }, [activeChannelId, fetchMessagesFromSupabase]);
 
-  // 3. Supabase Realtime Subscription for Messages
+  // Polling sync every 2.5 seconds to guarantee 100% message delivery
+  useEffect(() => {
+    if (!activeChannelId) return;
+    const interval = setInterval(() => {
+      fetchMessagesFromSupabase(activeChannelId);
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [activeChannelId, fetchMessagesFromSupabase]);
+
+  // 3. Supabase Realtime WebSocket Connection (Broadcast + Postgres Changes)
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase || !activeChannelId) return;
 
-    const channelSubscription = supabase
-      .channel(`public:messages:${activeChannelId}`)
+    const channel = supabase.channel(`realtime:channel:${activeChannelId}`);
+    supabaseRealtimeChannelRef.current = channel;
+
+    channel
+      .on('broadcast', { event: 'NEW_MESSAGE' }, (payload: any) => {
+        const msg = payload.payload?.message;
+        if (msg && msg.channel_id === activeChannelId) {
+          setAllMessages(prev => {
+            const currentList = prev[activeChannelId] || [];
+            if (currentList.some(m => m.id === msg.id)) return prev;
+            return { ...prev, [activeChannelId]: [...currentList, msg] };
+          });
+          if (currentUser && msg.author_id !== currentUser.id) {
+            sounds.playMessage();
+          }
+        }
+      })
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${activeChannelId}` },
+        { event: 'INSERT', schema: 'public', table: 'messages' },
         (payload) => {
           const newMsg = payload.new;
-          const authorProfile = allUsers.find(u => u.id === newMsg.author_id) || {
-            id: newMsg.author_id,
-            username: newMsg.author_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
-            display_name: newMsg.author_id.includes('cArthurDev') ? 'cArthurDev (Dono)' : 'Usuário',
-            avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${newMsg.author_id}`,
-            presence_status: 'online',
-            created_at: newMsg.created_at,
-          };
-
-          const fullMsg: Message = {
-            id: newMsg.id,
-            channel_id: newMsg.channel_id,
-            author_id: newMsg.author_id,
-            content: newMsg.content,
-            attachments: newMsg.attachments || [],
-            reactions: newMsg.reactions || [],
-            is_edited: newMsg.is_edited || false,
-            created_at: newMsg.created_at,
-            author: authorProfile,
-          };
-
-          setAllMessages(prev => {
-            const list = prev[activeChannelId] || [];
-            if (list.some(m => m.id === fullMsg.id)) return prev;
-            return { ...prev, [activeChannelId]: [...list, fullMsg] };
-          });
-
-          if (currentUser && fullMsg.author_id !== currentUser.id) {
-            sounds.playMessage();
+          if (newMsg && newMsg.channel_id === activeChannelId) {
+            fetchMessagesFromSupabase(activeChannelId);
           }
         }
       )
@@ -283,10 +277,11 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     return () => {
       if (supabase) {
-        supabase.removeChannel(channelSubscription);
+        supabase.removeChannel(channel);
       }
+      supabaseRealtimeChannelRef.current = null;
     };
-  }, [activeChannelId, allUsers, currentUser]);
+  }, [activeChannelId, currentUser, fetchMessagesFromSupabase]);
 
   useEffect(() => {
     localStorage.setItem('nexus_user_servers', JSON.stringify(servers));
@@ -318,65 +313,15 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [activeServerId, channels]);
 
-  // Realtime BroadcastChannel for multi-tab sync
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const bc = new BroadcastChannel('nexus_server_events');
-
-    bc.onmessage = (event) => {
-      const data = event.data;
-      if (data.type === 'NEW_MESSAGE') {
-        const { channelId, message } = data;
-        setAllMessages(prev => {
-          const currentList = prev[channelId] || [];
-          if (currentList.some(m => m.id === message.id)) return prev;
-          return { ...prev, [channelId]: [...currentList, message] };
-        });
-        if (currentUser && message.author_id !== currentUser.id) {
-          sounds.playMessage();
-        }
-      } else if (data.type === 'SERVER_CREATED') {
-        const { server, categories: cats, channels: chans } = data;
-        setServers(prev => {
-          if (prev.some(s => s.id === server.id)) return prev;
-          return [...prev, server];
-        });
-        if (cats) setCategories(prev => [...prev, ...cats]);
-        if (chans) setChannels(prev => [...prev, ...chans]);
-      } else if (data.type === 'TYPING') {
-        if (data.channelId === activeChannelId && data.user.id !== currentUser?.id) {
-          setTypingUsers(prev => {
-            const filtered = prev.filter(u => u.username !== data.user.username);
-            return [...filtered, { username: data.user.username, display_name: data.user.display_name, timestamp: Date.now() }];
-          });
-        }
-      }
-    };
-
-    return () => {
-      bc.close();
-    };
-  }, [activeChannelId, currentUser]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now();
-      setTypingUsers(prev => prev.filter(u => now - u.timestamp < 3500));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
-
   const activeServer = servers.find(s => s.id === activeServerId) || servers[0] || DEFAULT_MAIN_SERVER;
   const currentServerCategories = categories.filter(c => c.server_id === activeServerId);
   const currentServerChannels = channels.filter(c => c.server_id === activeServerId);
   const activeChannel = channels.find(c => c.id === activeChannelId) || null;
   const currentMessages = activeChannelId ? (allMessages[activeChannelId] || []) : [];
 
-  // All users are automatically members of all servers! cArthurDev is Owner
   const members: ServerMember[] = React.useMemo(() => {
     if (!activeServer) return [];
     
-    // Include all registered users + current user
     const usersMap = new Map<string, typeof currentUser>();
     allUsers.forEach(u => usersMap.set(u.id, u));
     if (currentUser) usersMap.set(currentUser.id, currentUser);
@@ -490,17 +435,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setChannels(prev => [...prev, defaultTextChannel, defaultVoiceChannel]);
     setActiveServerId(newServerId);
     setActiveChannelId(defaultTextChannel.id);
-
-    if (typeof window !== 'undefined') {
-      const bc = new BroadcastChannel('nexus_server_events');
-      bc.postMessage({
-        type: 'SERVER_CREATED',
-        server: newServer,
-        categories: [defaultCat],
-        channels: [defaultTextChannel, defaultVoiceChannel]
-      });
-      bc.close();
-    }
 
     return newServer;
   };
@@ -632,18 +566,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       author: currentUser,
     };
 
-    if (isSupabaseConfigured && supabase) {
-      await supabase.from('messages').insert({
-        id: newMsg.id,
-        channel_id: activeChannelId,
-        author_id: currentUser.id,
-        content: newMsg.content,
-        attachments: newMsg.attachments,
-        reactions: newMsg.reactions,
-        reply_to_id: replyToId || null,
-      });
-    }
-
+    // Update local state immediately
     setAllMessages(prev => {
       const list = prev[activeChannelId] || [];
       if (list.some(m => m.id === newMsg.id)) return prev;
@@ -652,10 +575,30 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     sounds.playPop();
 
-    if (typeof window !== 'undefined') {
-      const bc = new BroadcastChannel('nexus_server_events');
-      bc.postMessage({ type: 'NEW_MESSAGE', channelId: activeChannelId, message: newMsg });
-      bc.close();
+    // Broadcast in real-time via Supabase WebSocket
+    if (isSupabaseConfigured && supabase) {
+      try {
+        if (supabaseRealtimeChannelRef.current) {
+          supabaseRealtimeChannelRef.current.send({
+            type: 'broadcast',
+            event: 'NEW_MESSAGE',
+            payload: { message: newMsg }
+          });
+        }
+
+        // Save in Supabase database
+        await supabase.from('messages').insert({
+          id: newMsg.id,
+          channel_id: activeChannelId,
+          author_id: currentUser.id,
+          content: newMsg.content,
+          attachments: newMsg.attachments,
+          reactions: newMsg.reactions,
+          reply_to_id: replyToId || null,
+        });
+      } catch (err) {
+        console.error('Supabase send message error:', err);
+      }
     }
   };
 
@@ -717,14 +660,17 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const sendTypingSignal = useCallback(() => {
-    if (!activeChannelId || !currentUser || typeof window === 'undefined') return;
-    const bc = new BroadcastChannel('nexus_server_events');
-    bc.postMessage({
-      type: 'TYPING',
-      channelId: activeChannelId,
-      user: { id: currentUser.id, username: currentUser.username, display_name: currentUser.display_name }
-    });
-    bc.close();
+    if (!activeChannelId || !currentUser) return;
+    if (supabaseRealtimeChannelRef.current) {
+      supabaseRealtimeChannelRef.current.send({
+        type: 'broadcast',
+        event: 'TYPING',
+        payload: {
+          channelId: activeChannelId,
+          user: { id: currentUser.id, username: currentUser.username, display_name: currentUser.display_name }
+        }
+      });
+    }
   }, [activeChannelId, currentUser]);
 
   return (
