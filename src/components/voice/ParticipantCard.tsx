@@ -22,17 +22,21 @@ export const ParticipantCard: React.FC<ParticipantCardProps> = ({
 
   // Attach webcam stream to video element
   useEffect(() => {
-    if (videoRef.current && activeCameraMedia && participant.is_camera_on && !participant.is_screen_sharing) {
-      videoRef.current.srcObject = activeCameraMedia;
-      videoRef.current.play().catch(() => {});
+    const videoEl = videoRef.current;
+    if (videoEl && activeCameraMedia && participant.is_camera_on && !participant.is_screen_sharing) {
+      videoEl.muted = true;
+      videoEl.srcObject = activeCameraMedia;
+      videoEl.play().catch(e => console.warn('Camera play notice:', e));
     }
   }, [activeCameraMedia, participant.is_camera_on, participant.is_screen_sharing]);
 
   // Attach screen share stream to screen video element
   useEffect(() => {
-    if (screenRef.current && activeScreenMedia && participant.is_screen_sharing) {
-      screenRef.current.srcObject = activeScreenMedia;
-      screenRef.current.play().catch(() => {});
+    const screenEl = screenRef.current;
+    if (screenEl && activeScreenMedia && participant.is_screen_sharing) {
+      screenEl.muted = true;
+      screenEl.srcObject = activeScreenMedia;
+      screenEl.play().catch(e => console.warn('Screen play notice:', e));
     }
   }, [activeScreenMedia, participant.is_screen_sharing]);
 
@@ -54,10 +58,12 @@ export const ParticipantCard: React.FC<ParticipantCardProps> = ({
             ref={screenRef}
             autoPlay
             playsInline
+            muted
+            onLoadedMetadata={(e) => e.currentTarget.play().catch(() => {})}
             className="w-full h-full object-contain"
           />
-          <div className="absolute top-3 left-3 bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold px-2.5 py-1 rounded-lg flex items-center gap-1.5 backdrop-blur-md z-10">
-            <Monitor className="w-3.5 h-3.5" />
+          <div className="absolute top-3 left-3 bg-emerald-950/90 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold px-2.5 py-1 rounded-lg flex items-center gap-1.5 backdrop-blur-md z-10">
+            <Monitor className="w-3.5 h-3.5 animate-pulse" />
             <span>Transmissão de Tela</span>
           </div>
         </div>
@@ -69,6 +75,7 @@ export const ParticipantCard: React.FC<ParticipantCardProps> = ({
             autoPlay
             playsInline
             muted
+            onLoadedMetadata={(e) => e.currentTarget.play().catch(() => {})}
             className="w-full h-full object-cover -scale-x-100"
           />
           <div className="absolute top-3 left-3 bg-nexus-950/80 border border-white/10 text-slate-300 text-[11px] font-bold px-2.5 py-1 rounded-lg flex items-center gap-1.5 backdrop-blur-md z-10">
