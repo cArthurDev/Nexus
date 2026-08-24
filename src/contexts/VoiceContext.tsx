@@ -547,6 +547,11 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         localStream.getVideoTracks().forEach(track => {
           track.stop();
           localStream.removeTrack(track);
+          peerConnectionsRef.current.forEach(pc => {
+            const senders = pc.getSenders();
+            const sender = senders.find(s => s.track === track);
+            if (sender) pc.removeTrack(sender);
+          });
         });
       }
       setIsCameraOn(false);
@@ -564,9 +569,18 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const videoTrack = videoStream.getVideoTracks()[0];
         if (localStream && videoTrack) {
           localStream.addTrack(videoTrack);
-          peerConnectionsRef.current.forEach(pc => {
+          for (const [remoteId, pc] of peerConnectionsRef.current.entries()) {
             pc.addTrack(videoTrack, localStream);
-          });
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            if (realtimeChannelRef.current && currentUser) {
+              realtimeChannelRef.current.send({
+                type: 'broadcast',
+                event: 'WEBRTC_OFFER',
+                payload: { from: currentUser.id, to: remoteId, offer }
+              });
+            }
+          }
         } else if (videoTrack) {
           setLocalStream(videoStream);
         }
@@ -581,7 +595,14 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const toggleScreenShare = async () => {
     if (isScreenSharing) {
       if (screenStream) {
-        screenStream.getTracks().forEach(track => track.stop());
+        screenStream.getTracks().forEach(track => {
+          track.stop();
+          peerConnectionsRef.current.forEach(pc => {
+            const senders = pc.getSenders();
+            const sender = senders.find(s => s.track === track);
+            if (sender) pc.removeTrack(sender);
+          });
+        });
         setScreenStream(null);
       }
       setIsScreenSharing(false);
@@ -592,10 +613,31 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           audio: true
         });
 
-        captureStream.getVideoTracks()[0].onended = () => {
+        const screenTrack = captureStream.getVideoTracks()[0];
+
+        screenTrack.onended = () => {
           setIsScreenSharing(false);
           setScreenStream(null);
+          peerConnectionsRef.current.forEach(pc => {
+            const senders = pc.getSenders();
+            const sender = senders.find(s => s.track === screenTrack);
+            if (sender) pc.removeTrack(sender);
+          });
         };
+
+        // Add track to all connected peers and renegotiate offer
+        for (const [remoteId, pc] of peerConnectionsRef.current.entries()) {
+          pc.addTrack(screenTrack, captureStream);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          if (realtimeChannelRef.current && currentUser) {
+            realtimeChannelRef.current.send({
+              type: 'broadcast',
+              event: 'WEBRTC_OFFER',
+              payload: { from: currentUser.id, to: remoteId, offer }
+            });
+          }
+        }
 
         setScreenStream(captureStream);
         setIsScreenSharing(true);
