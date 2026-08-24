@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import type { VoiceParticipant, UserProfile } from '../types';
 import { useAuth } from './AuthContext';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { sounds } from '../lib/sounds';
 
 interface VoiceContextType {
@@ -51,7 +52,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const analyserRef = useRef<AnalyserNode | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  const broadcastRef = useRef<BroadcastChannel | null>(null);
+  const realtimeChannelRef = useRef<any>(null);
 
   const setupAudioDetection = useCallback((stream: MediaStream) => {
     try {
@@ -116,34 +117,105 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setIsSpeaking(false);
   }, []);
 
+  // Supabase Presence Channel for Universal Voice Room across all computers
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const bc = new BroadcastChannel('nexus_voice_mesh');
-    broadcastRef.current = bc;
+    if (!activeVoiceChannelId || !currentUser) return;
 
-    bc.onmessage = (e) => {
-      const data = e.data;
-      if (data.type === 'PEER_STATUS' && data.channelId === activeVoiceChannelId) {
-        if (data.participant.user_id !== currentUser?.id) {
-          setRemoteParticipants(prev => {
-            const index = prev.findIndex(p => p.user_id === data.participant.user_id);
-            if (index >= 0) {
-              const updated = [...prev];
-              updated[index] = { ...updated[index], ...data.participant };
-              return updated;
+    if (isSupabaseConfigured && supabase) {
+      const channel = supabase.channel(`voice_room:${activeVoiceChannelId}`, {
+        config: {
+          presence: {
+            key: currentUser.id,
+          },
+        },
+      });
+
+      realtimeChannelRef.current = channel;
+
+      channel
+        .on('presence', { event: 'sync' }, () => {
+          const state = channel.presenceState();
+          const remotes: VoiceParticipant[] = [];
+
+          Object.keys(state).forEach((key) => {
+            if (key !== currentUser.id) {
+              const presenceList = state[key] as any[];
+              if (presenceList && presenceList.length > 0) {
+                const latest = presenceList[presenceList.length - 1];
+                remotes.push(latest.participant);
+              }
             }
-            return [...prev, data.participant];
           });
-        }
-      } else if (data.type === 'PEER_LEAVE') {
-        setRemoteParticipants(prev => prev.filter(p => p.user_id !== data.userId));
-      }
-    };
 
-    return () => {
-      bc.close();
-    };
+          setRemoteParticipants(remotes);
+        })
+        .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+          if (key !== currentUser.id && newPresences.length > 0) {
+            const p = (newPresences[0] as any).participant;
+            setRemoteParticipants(prev => {
+              if (prev.some(item => item.user_id === p.user_id)) return prev;
+              return [...prev, p];
+            });
+            sounds.playJoinVoice();
+          }
+        })
+        .on('presence', { event: 'leave' }, ({ key }) => {
+          if (key !== currentUser.id) {
+            setRemoteParticipants(prev => prev.filter(p => p.user_id !== key));
+            sounds.playLeaveVoice();
+          }
+        })
+        .subscribe(async (status) => {
+          if (status === 'SUBSCRIBED') {
+            await channel.track({
+              participant: {
+                id: `vp_${currentUser.id}`,
+                user_id: currentUser.id,
+                channel_id: activeVoiceChannelId,
+                is_muted: isMuted,
+                is_deafened: isDeafened,
+                is_speaking: isSpeaking,
+                is_camera_on: isCameraOn,
+                is_screen_sharing: isScreenSharing,
+                audio_level: isSpeaking ? 80 : 0,
+                joined_at: new Date().toISOString(),
+                profile: currentUser,
+              },
+            });
+          }
+        });
+
+      return () => {
+        channel.untrack().then(() => {
+          if (supabase) {
+            supabase.removeChannel(channel);
+          }
+        });
+        realtimeChannelRef.current = null;
+      };
+    }
   }, [activeVoiceChannelId, currentUser]);
+
+  // Update presence state when local mic/cam/screen changes
+  useEffect(() => {
+    if (realtimeChannelRef.current && currentUser && activeVoiceChannelId) {
+      realtimeChannelRef.current.track({
+        participant: {
+          id: `vp_${currentUser.id}`,
+          user_id: currentUser.id,
+          channel_id: activeVoiceChannelId,
+          is_muted: isMuted,
+          is_deafened: isDeafened,
+          is_speaking: isSpeaking,
+          is_camera_on: isCameraOn,
+          is_screen_sharing: isScreenSharing,
+          audio_level: isSpeaking ? 80 : 0,
+          joined_at: new Date().toISOString(),
+          profile: currentUser,
+        },
+      });
+    }
+  }, [isMuted, isDeafened, isSpeaking, isCameraOn, isScreenSharing, currentUser, activeVoiceChannelId]);
 
   const joinVoiceChannel = async (channelId: string, channelName: string, serverName?: string) => {
     if (activeVoiceChannelId === channelId) return;
@@ -191,12 +263,8 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setScreenStream(null);
     }
 
-    if (broadcastRef.current && currentUser) {
-      broadcastRef.current.postMessage({
-        type: 'PEER_LEAVE',
-        channelId: activeVoiceChannelId,
-        userId: currentUser.id
-      });
+    if (realtimeChannelRef.current) {
+      realtimeChannelRef.current.untrack();
     }
 
     setActiveVoiceChannelId(null);
@@ -259,19 +327,20 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             width: { ideal: 1280 },
             height: { ideal: 720 },
             facingMode: 'user'
-          }
+          },
+          audio: false
         });
 
         const videoTrack = videoStream.getVideoTracks()[0];
-        if (localStream) {
+        if (localStream && videoTrack) {
           localStream.addTrack(videoTrack);
-        } else {
+        } else if (videoTrack) {
           setLocalStream(videoStream);
         }
+
         setIsCameraOn(true);
       } catch (err) {
-        console.error('Failed to enable camera', err);
-        alert('Não foi possível acessar a câmera.');
+        console.error('Error enabling webcam', err);
       }
     }
   };
@@ -285,47 +354,52 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setIsScreenSharing(false);
     } else {
       try {
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            cursor: 'always'
-          } as MediaTrackConstraints,
-          audio: false,
+        const captureStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true
         });
 
-        const screenTrack = displayStream.getVideoTracks()[0];
-        screenTrack.onended = () => {
+        captureStream.getVideoTracks()[0].onended = () => {
           setIsScreenSharing(false);
           setScreenStream(null);
         };
 
-        setScreenStream(displayStream);
+        setScreenStream(captureStream);
         setIsScreenSharing(true);
-        sounds.playPop();
       } catch (err) {
-        console.error('Failed to get display media', err);
+        console.error('Error sharing screen', err);
       }
     }
   };
 
-  const localParticipant: VoiceParticipant | null = currentUser && activeVoiceChannelId ? {
-    id: `vp_me_${activeVoiceChannelId}`,
-    user_id: currentUser.id,
-    channel_id: activeVoiceChannelId,
-    profile: currentUser,
-    is_muted: isMuted,
-    is_deafened: isDeafened,
-    is_camera_on: isCameraOn,
-    is_screen_sharing: isScreenSharing,
-    is_speaking: !isMuted && isSpeaking,
-    audio_level: isSpeaking ? 80 : 0,
-    stream: localStream || undefined,
-    screen_stream: screenStream || undefined,
-    joined_at: new Date().toISOString(),
-  } : null;
+  const allParticipants: VoiceParticipant[] = React.useMemo(() => {
+    if (!activeVoiceChannelId || !currentUser) return [];
 
-  const participants: VoiceParticipant[] = localParticipant 
-    ? [localParticipant, ...remoteParticipants]
-    : remoteParticipants;
+    const myParticipant: VoiceParticipant = {
+      id: `vp_${currentUser.id}`,
+      user_id: currentUser.id,
+      channel_id: activeVoiceChannelId,
+      is_muted: isMuted,
+      is_deafened: isDeafened,
+      is_speaking: isSpeaking,
+      is_camera_on: isCameraOn,
+      is_screen_sharing: isScreenSharing,
+      audio_level: isSpeaking ? 80 : 0,
+      joined_at: new Date().toISOString(),
+      profile: currentUser,
+    };
+
+    return [myParticipant, ...remoteParticipants];
+  }, [
+    activeVoiceChannelId,
+    currentUser,
+    isMuted,
+    isDeafened,
+    isSpeaking,
+    isCameraOn,
+    isScreenSharing,
+    remoteParticipants
+  ]);
 
   return (
     <VoiceContext.Provider
@@ -333,13 +407,13 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         activeVoiceChannelId,
         activeVoiceChannelName,
         activeServerName,
-        isInVoice: Boolean(activeVoiceChannelId),
+        isInVoice: !!activeVoiceChannelId,
         isMuted,
         isDeafened,
         isCameraOn,
         isScreenSharing,
-        isSpeaking: !isMuted && isSpeaking,
-        participants,
+        isSpeaking,
+        participants: allParticipants,
         localStream,
         screenStream,
         spotlightUserId,

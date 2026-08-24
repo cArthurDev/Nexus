@@ -37,24 +37,83 @@ const GLOBAL_SERVERS_REGISTRY = 'nexus_global_servers_registry';
 const GLOBAL_CHANNELS_REGISTRY = 'nexus_global_channels_registry';
 const GLOBAL_CATEGORIES_REGISTRY = 'nexus_global_categories_registry';
 
+// Default initial open server for everyone
+const DEFAULT_MAIN_SERVER: Server = {
+  id: 'srv_nexus_main',
+  name: 'Nexus Oficial',
+  icon_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=120&auto=format&fit=crop&q=80',
+  banner_url: '',
+  description: 'Servidor oficial e público aberto para todos os usuários!',
+  owner_id: 'usr_cArthurDev',
+  invite_code: 'nexus-oficial',
+  created_at: new Date().toISOString(),
+  members_count: 2,
+};
+
+const DEFAULT_MAIN_CAT: Category = {
+  id: 'cat_main_geral',
+  server_id: 'srv_nexus_main',
+  name: 'CANAIS PRINCIPAIS',
+  position: 1,
+};
+
+const DEFAULT_TEXT_CHAN: Channel = {
+  id: 'chn_main_geral_text',
+  server_id: 'srv_nexus_main',
+  category_id: 'cat_main_geral',
+  name: 'geral',
+  type: 'TEXT',
+  topic: 'Chat público aberto para todos',
+  position: 1,
+  created_at: new Date().toISOString(),
+};
+
+const DEFAULT_VOICE_CHAN: Channel = {
+  id: 'chn_main_geral_voice',
+  server_id: 'srv_nexus_main',
+  category_id: 'cat_main_geral',
+  name: 'Sala de Voz',
+  type: 'VOICE',
+  position: 2,
+  created_at: new Date().toISOString(),
+};
+
 export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { currentUser, allUsers } = useAuth();
   
   const [servers, setServers] = useState<Server[]>(() => {
     const saved = localStorage.getItem('nexus_user_servers');
-    return saved ? JSON.parse(saved) : [];
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed;
+      } catch {}
+    }
+    return [DEFAULT_MAIN_SERVER];
   });
 
-  const [activeServerId, setActiveServerId] = useState<string | null>(servers[0]?.id || null);
+  const [activeServerId, setActiveServerId] = useState<string | null>(servers[0]?.id || DEFAULT_MAIN_SERVER.id);
 
   const [categories, setCategories] = useState<Category[]>(() => {
     const saved = localStorage.getItem('nexus_user_categories');
-    return saved ? JSON.parse(saved) : [];
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed;
+      } catch {}
+    }
+    return [DEFAULT_MAIN_CAT];
   });
 
   const [channels, setChannels] = useState<Channel[]>(() => {
     const saved = localStorage.getItem('nexus_user_channels');
-    return saved ? JSON.parse(saved) : [];
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed;
+      } catch {}
+    }
+    return [DEFAULT_TEXT_CHAN, DEFAULT_VOICE_CHAN];
   });
 
   const [allMessages, setAllMessages] = useState<Record<string, Message[]>>(() => {
@@ -63,46 +122,67 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   });
 
   const serverChannels = channels.filter(c => c.server_id === activeServerId);
-  const [activeChannelId, setActiveChannelId] = useState<string | null>(serverChannels[0]?.id || null);
+  const [activeChannelId, setActiveChannelId] = useState<string | null>(serverChannels[0]?.id || DEFAULT_TEXT_CHAN.id);
 
   const [typingUsers, setTypingUsers] = useState<{ username: string; display_name: string; timestamp: number }[]>([]);
 
-  // 1. Fetch servers, categories, and channels from Supabase
+  // 1. Fetch ALL open servers from Supabase
   useEffect(() => {
-    async function loadSupabaseServers() {
-      if (isSupabaseConfigured && supabase && currentUser) {
+    async function loadAllOpenServers() {
+      if (isSupabaseConfigured && supabase) {
         try {
-          const { data: memberRows } = await supabase
-            .from('server_members')
-            .select('server_id')
-            .eq('user_id', currentUser.id);
+          const { data: serverList } = await supabase
+            .from('servers')
+            .select('*');
 
-          const serverIds = memberRows?.map(r => r.server_id) || [];
-
-          if (serverIds.length > 0) {
-            const { data: serverList } = await supabase
-              .from('servers')
-              .select('*')
-              .in('id', serverIds);
-
-            if (serverList && serverList.length > 0) {
-              setServers(serverList);
-              if (!activeServerId) {
-                setActiveServerId(serverList[0].id);
-              }
-
-              const { data: catList } = await supabase
-                .from('categories')
-                .select('*')
-                .in('server_id', serverIds);
-              if (catList) setCategories(catList);
-
-              const { data: chanList } = await supabase
-                .from('channels')
-                .select('*')
-                .in('server_id', serverIds);
-              if (chanList) setChannels(chanList);
+          if (serverList && serverList.length > 0) {
+            setServers(serverList);
+            if (!activeServerId || !serverList.some(s => s.id === activeServerId)) {
+              setActiveServerId(serverList[0].id);
             }
+
+            const { data: catList } = await supabase.from('categories').select('*');
+            if (catList && catList.length > 0) setCategories(catList);
+
+            const { data: chanList } = await supabase.from('channels').select('*');
+            if (chanList && chanList.length > 0) setChannels(chanList);
+          } else {
+            // Seed main server into Supabase if empty
+            await supabase.from('servers').upsert({
+              id: DEFAULT_MAIN_SERVER.id,
+              name: DEFAULT_MAIN_SERVER.name,
+              icon_url: DEFAULT_MAIN_SERVER.icon_url,
+              description: DEFAULT_MAIN_SERVER.description,
+              owner_id: DEFAULT_MAIN_SERVER.owner_id,
+              invite_code: DEFAULT_MAIN_SERVER.invite_code,
+            });
+
+            await supabase.from('categories').upsert({
+              id: DEFAULT_MAIN_CAT.id,
+              server_id: DEFAULT_MAIN_SERVER.id,
+              name: DEFAULT_MAIN_CAT.name,
+              position: 1,
+            });
+
+            await supabase.from('channels').upsert([
+              {
+                id: DEFAULT_TEXT_CHAN.id,
+                server_id: DEFAULT_MAIN_SERVER.id,
+                category_id: DEFAULT_MAIN_CAT.id,
+                name: DEFAULT_TEXT_CHAN.name,
+                type: 'TEXT',
+                topic: DEFAULT_TEXT_CHAN.topic,
+                position: 1,
+              },
+              {
+                id: DEFAULT_VOICE_CHAN.id,
+                server_id: DEFAULT_MAIN_SERVER.id,
+                category_id: DEFAULT_MAIN_CAT.id,
+                name: DEFAULT_VOICE_CHAN.name,
+                type: 'VOICE',
+                position: 2,
+              }
+            ]);
           }
         } catch (err) {
           console.error('Error fetching Supabase servers:', err);
@@ -110,7 +190,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     }
 
-    loadSupabaseServers();
+    loadAllOpenServers();
   }, [currentUser]);
 
   // 2. Fetch message history for active channel
@@ -130,8 +210,8 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const formatted: Message[] = msgs.map(m => {
               const authorProfile = allUsers.find(u => u.id === m.author_id) || {
                 id: m.author_id,
-                username: 'usuario',
-                display_name: 'Usuário',
+                username: m.author_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
+                display_name: m.author_id.includes('cArthurDev') ? 'cArthurDev (Dono)' : 'Usuário',
                 avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${m.author_id}`,
                 presence_status: 'online',
                 created_at: m.created_at,
@@ -169,8 +249,8 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           const newMsg = payload.new;
           const authorProfile = allUsers.find(u => u.id === newMsg.author_id) || {
             id: newMsg.author_id,
-            username: 'usuario',
-            display_name: 'Usuário',
+            username: newMsg.author_id.includes('cArthurDev') ? 'cArthurDev' : 'usuario',
+            display_name: newMsg.author_id.includes('cArthurDev') ? 'cArthurDev (Dono)' : 'Usuário',
             avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${newMsg.author_id}`,
             presence_status: 'online',
             created_at: newMsg.created_at,
@@ -238,7 +318,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [activeServerId, channels]);
 
-  // Realtime BroadcastChannel for local/multi-tab sync
+  // Realtime BroadcastChannel for multi-tab sync
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const bc = new BroadcastChannel('nexus_server_events');
@@ -257,10 +337,12 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         }
       } else if (data.type === 'SERVER_CREATED') {
         const { server, categories: cats, channels: chans } = data;
-        const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
-        if (!globalServers.some(s => s.id === server.id)) {
-          localStorage.setItem(GLOBAL_SERVERS_REGISTRY, JSON.stringify([...globalServers, server]));
-        }
+        setServers(prev => {
+          if (prev.some(s => s.id === server.id)) return prev;
+          return [...prev, server];
+        });
+        if (cats) setCategories(prev => [...prev, ...cats]);
+        if (chans) setChannels(prev => [...prev, ...chans]);
       } else if (data.type === 'TYPING') {
         if (data.channelId === activeChannelId && data.user.id !== currentUser?.id) {
           setTypingUsers(prev => {
@@ -284,22 +366,26 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return () => clearInterval(interval);
   }, []);
 
-  const activeServer = servers.find(s => s.id === activeServerId) || null;
+  const activeServer = servers.find(s => s.id === activeServerId) || servers[0] || DEFAULT_MAIN_SERVER;
   const currentServerCategories = categories.filter(c => c.server_id === activeServerId);
   const currentServerChannels = channels.filter(c => c.server_id === activeServerId);
   const activeChannel = channels.find(c => c.id === activeChannelId) || null;
   const currentMessages = activeChannelId ? (allMessages[activeChannelId] || []) : [];
 
+  // All users are automatically members of all servers! cArthurDev is Owner
   const members: ServerMember[] = React.useMemo(() => {
     if (!activeServer) return [];
-    const serverUsers = allUsers.filter(u => u.id === activeServer.owner_id || u.id === currentUser?.id);
-    if (serverUsers.length === 0 && currentUser) {
-      serverUsers.push(currentUser);
-    }
+    
+    // Include all registered users + current user
+    const usersMap = new Map<string, typeof currentUser>();
+    allUsers.forEach(u => usersMap.set(u.id, u));
+    if (currentUser) usersMap.set(currentUser.id, currentUser);
 
-    return serverUsers.map((user) => {
-      let role: UserRole = 'member';
-      if (user.id === activeServer.owner_id) role = 'owner';
+    const userList = Array.from(usersMap.values()).filter(Boolean) as typeof allUsers;
+
+    return userList.map((user) => {
+      const isArthur = user.username.toLowerCase() === 'carthurdev' || user.id === activeServer.owner_id;
+      let role: UserRole = isArthur ? 'owner' : 'member';
 
       return {
         id: `mem_${activeServer.id}_${user.id}`,
@@ -307,7 +393,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         user_id: user.id,
         role,
         joined_at: new Date().toISOString(),
-        profile: user.id === currentUser?.id ? currentUser : user,
+        profile: user,
       };
     });
   }, [activeServer, currentUser, allUsers]);
@@ -315,18 +401,16 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const createServer = async (name: string, iconUrl?: string, description?: string): Promise<Server> => {
     if (!currentUser) throw new Error('Not authenticated');
     
+    const isArthur = currentUser.username.toLowerCase() === 'carthurdev';
     const newServerId = `srv_${Date.now()}`;
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const invite_code = `nexus-${code}`.toLowerCase();
-
     const newServer: Server = {
       id: newServerId,
       name,
       icon_url: iconUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${encodeURIComponent(name)}`,
       banner_url: '',
       description: description || '',
-      owner_id: currentUser.id,
-      invite_code,
+      owner_id: isArthur ? currentUser.id : 'usr_cArthurDev',
+      invite_code: `nexus-${Math.random().toString(36).substring(2, 8)}`,
       created_at: new Date().toISOString(),
       members_count: 1,
     };
@@ -361,29 +445,23 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     if (isSupabaseConfigured && supabase) {
       try {
-        await supabase.from('servers').insert({
+        await supabase.from('servers').upsert({
           id: newServer.id,
           name: newServer.name,
           icon_url: newServer.icon_url,
           description: newServer.description,
-          owner_id: currentUser.id,
+          owner_id: newServer.owner_id,
           invite_code: newServer.invite_code,
         });
 
-        await supabase.from('server_members').insert({
-          server_id: newServer.id,
-          user_id: currentUser.id,
-          role: 'owner',
-        });
-
-        await supabase.from('categories').insert({
+        await supabase.from('categories').upsert({
           id: defaultCat.id,
           server_id: newServer.id,
           name: defaultCat.name,
           position: 1,
         });
 
-        await supabase.from('channels').insert([
+        await supabase.from('channels').upsert([
           {
             id: defaultTextChannel.id,
             server_id: newServer.id,
@@ -407,15 +485,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     }
 
-    const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
-    localStorage.setItem(GLOBAL_SERVERS_REGISTRY, JSON.stringify([...globalServers.filter(s => s.id !== newServer.id), newServer]));
-
-    const globalCats: Category[] = JSON.parse(localStorage.getItem(GLOBAL_CATEGORIES_REGISTRY) || '[]');
-    localStorage.setItem(GLOBAL_CATEGORIES_REGISTRY, JSON.stringify([...globalCats, defaultCat]));
-
-    const globalChans: Channel[] = JSON.parse(localStorage.getItem(GLOBAL_CHANNELS_REGISTRY) || '[]');
-    localStorage.setItem(GLOBAL_CHANNELS_REGISTRY, JSON.stringify([...globalChans, defaultTextChannel, defaultVoiceChannel]));
-
     setServers(prev => [...prev.filter(s => s.id !== newServer.id), newServer]);
     setCategories(prev => [...prev, defaultCat]);
     setChannels(prev => [...prev, defaultTextChannel, defaultVoiceChannel]);
@@ -437,89 +506,13 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const joinServerByInvite = async (inviteCode: string): Promise<boolean> => {
-    if (!currentUser) return false;
-    const cleanCode = inviteCode.trim().toLowerCase().replace(/^https?:\/\/.*\/join\//, '');
-
-    if (isSupabaseConfigured && supabase) {
-      try {
-        const { data: server, error } = await supabase
-          .from('servers')
-          .select('*')
-          .eq('invite_code', cleanCode)
-          .single();
-
-        if (server && !error) {
-          await supabase.from('server_members').upsert({
-            server_id: server.id,
-            user_id: currentUser.id,
-            role: 'member',
-          });
-
-          const { data: serverCats } = await supabase
-            .from('categories')
-            .select('*')
-            .eq('server_id', server.id);
-
-          const { data: serverChans } = await supabase
-            .from('channels')
-            .select('*')
-            .eq('server_id', server.id);
-
-          setServers(prev => {
-            if (prev.some(s => s.id === server.id)) return prev;
-            return [...prev, server];
-          });
-
-          if (serverCats && serverCats.length > 0) {
-            setCategories(prev => [...prev.filter(c => c.server_id !== server.id), ...serverCats]);
-          }
-
-          if (serverChans && serverChans.length > 0) {
-            setChannels(prev => [...prev.filter(c => c.server_id !== server.id), ...serverChans]);
-          }
-
-          setActiveServerId(server.id);
-          sounds.playPop();
-          return true;
-        }
-      } catch (err) {
-        console.error('Error joining server via Supabase:', err);
-      }
-    }
-
-    const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
-    const allKnown = [...servers, ...globalServers];
-    const serverToJoin = allKnown.find(s => 
-      s.invite_code.toLowerCase() === cleanCode || 
-      s.id.toLowerCase() === cleanCode ||
-      s.name.toLowerCase() === cleanCode
-    );
-    
+    const cleanCode = inviteCode.trim().toLowerCase();
+    const serverToJoin = servers.find(s => s.invite_code.toLowerCase() === cleanCode || s.id.toLowerCase() === cleanCode);
     if (serverToJoin) {
-      const globalCats: Category[] = JSON.parse(localStorage.getItem(GLOBAL_CATEGORIES_REGISTRY) || '[]');
-      const globalChans: Channel[] = JSON.parse(localStorage.getItem(GLOBAL_CHANNELS_REGISTRY) || '[]');
-
-      const relevantCats = globalCats.filter(c => c.server_id === serverToJoin.id);
-      const relevantChans = globalChans.filter(c => c.server_id === serverToJoin.id);
-
-      setServers(prev => {
-        if (prev.some(s => s.id === serverToJoin.id)) return prev;
-        return [...prev, serverToJoin];
-      });
-
-      if (relevantCats.length > 0) {
-        setCategories(prev => [...prev.filter(c => c.server_id !== serverToJoin.id), ...relevantCats]);
-      }
-      if (relevantChans.length > 0) {
-        setChannels(prev => [...prev.filter(c => c.server_id !== serverToJoin.id), ...relevantChans]);
-      }
-
       setActiveServerId(serverToJoin.id);
-      sounds.playPop();
       return true;
     }
-
-    return false;
+    return true;
   };
 
   const deleteServer = async (serverId: string) => {
@@ -551,7 +544,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
 
     if (isSupabaseConfigured && supabase) {
-      await supabase.from('channels').insert({
+      await supabase.from('channels').upsert({
         id: newChannel.id,
         server_id: activeServerId,
         category_id: newChannel.category_id,
@@ -561,9 +554,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         position: newChannel.position,
       });
     }
-
-    const globalChans: Channel[] = JSON.parse(localStorage.getItem(GLOBAL_CHANNELS_REGISTRY) || '[]');
-    localStorage.setItem(GLOBAL_CHANNELS_REGISTRY, JSON.stringify([...globalChans, newChannel]));
 
     setChannels(prev => [...prev, newChannel]);
     if (type === 'TEXT') {
@@ -600,16 +590,13 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
 
     if (isSupabaseConfigured && supabase) {
-      await supabase.from('categories').insert({
+      await supabase.from('categories').upsert({
         id: newCat.id,
         server_id: activeServerId,
         name: newCat.name,
         position: newCat.position,
       });
     }
-
-    const globalCats: Category[] = JSON.parse(localStorage.getItem(GLOBAL_CATEGORIES_REGISTRY) || '[]');
-    localStorage.setItem(GLOBAL_CATEGORIES_REGISTRY, JSON.stringify([...globalCats, newCat]));
 
     setCategories(prev => [...prev, newCat]);
     return newCat;
