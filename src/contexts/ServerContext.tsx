@@ -67,12 +67,11 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const [typingUsers, setTypingUsers] = useState<{ username: string; display_name: string; timestamp: number }[]>([]);
 
-  // Load from Supabase on mount if configured
+  // 1. Fetch servers, categories, and channels from Supabase
   useEffect(() => {
     async function loadSupabaseServers() {
       if (isSupabaseConfigured && supabase && currentUser) {
         try {
-          // Fetch servers where user is member or owner
           const { data: memberRows } = await supabase
             .from('server_members')
             .select('server_id')
@@ -92,7 +91,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
                 setActiveServerId(serverList[0].id);
               }
 
-              // Fetch channels & categories for these servers
               const { data: catList } = await supabase
                 .from('categories')
                 .select('*')
@@ -114,6 +112,101 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     loadSupabaseServers();
   }, [currentUser]);
+
+  // 2. Fetch message history for active channel
+  useEffect(() => {
+    async function loadChannelMessages() {
+      if (!activeChannelId) return;
+
+      if (isSupabaseConfigured && supabase) {
+        try {
+          const { data: msgs, error } = await supabase
+            .from('messages')
+            .select('*')
+            .eq('channel_id', activeChannelId)
+            .order('created_at', { ascending: true });
+
+          if (msgs && !error) {
+            const formatted: Message[] = msgs.map(m => {
+              const authorProfile = allUsers.find(u => u.id === m.author_id) || {
+                id: m.author_id,
+                username: 'usuario',
+                display_name: 'Usuário',
+                avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${m.author_id}`,
+                presence_status: 'online',
+                created_at: m.created_at,
+              };
+              return {
+                ...m,
+                author: authorProfile,
+              };
+            });
+
+            setAllMessages(prev => ({
+              ...prev,
+              [activeChannelId]: formatted
+            }));
+          }
+        } catch (err) {
+          console.error('Error loading channel messages:', err);
+        }
+      }
+    }
+
+    loadChannelMessages();
+  }, [activeChannelId, allUsers]);
+
+  // 3. Supabase Realtime Subscription for Messages
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase || !activeChannelId) return;
+
+    const channelSubscription = supabase
+      .channel(`public:messages:${activeChannelId}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${activeChannelId}` },
+        (payload) => {
+          const newMsg = payload.new;
+          const authorProfile = allUsers.find(u => u.id === newMsg.author_id) || {
+            id: newMsg.author_id,
+            username: 'usuario',
+            display_name: 'Usuário',
+            avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${newMsg.author_id}`,
+            presence_status: 'online',
+            created_at: newMsg.created_at,
+          };
+
+          const fullMsg: Message = {
+            id: newMsg.id,
+            channel_id: newMsg.channel_id,
+            author_id: newMsg.author_id,
+            content: newMsg.content,
+            attachments: newMsg.attachments || [],
+            reactions: newMsg.reactions || [],
+            is_edited: newMsg.is_edited || false,
+            created_at: newMsg.created_at,
+            author: authorProfile,
+          };
+
+          setAllMessages(prev => {
+            const list = prev[activeChannelId] || [];
+            if (list.some(m => m.id === fullMsg.id)) return prev;
+            return { ...prev, [activeChannelId]: [...list, fullMsg] };
+          });
+
+          if (currentUser && fullMsg.author_id !== currentUser.id) {
+            sounds.playMessage();
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      if (supabase) {
+        supabase.removeChannel(channelSubscription);
+      }
+    };
+  }, [activeChannelId, allUsers, currentUser]);
 
   useEffect(() => {
     localStorage.setItem('nexus_user_servers', JSON.stringify(servers));
@@ -145,7 +238,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [activeServerId, channels]);
 
-  // Realtime BroadcastChannel for multi-tab sync
+  // Realtime BroadcastChannel for local/multi-tab sync
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const bc = new BroadcastChannel('nexus_server_events');
@@ -163,7 +256,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           sounds.playMessage();
         }
       } else if (data.type === 'SERVER_CREATED') {
-        // Shared registry sync
         const { server, categories: cats, channels: chans } = data;
         const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
         if (!globalServers.some(s => s.id === server.id)) {
@@ -198,7 +290,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const activeChannel = channels.find(c => c.id === activeChannelId) || null;
   const currentMessages = activeChannelId ? (allMessages[activeChannelId] || []) : [];
 
-  // Generate dynamic members list for active server
   const members: ServerMember[] = React.useMemo(() => {
     if (!activeServer) return [];
     const serverUsers = allUsers.filter(u => u.id === activeServer.owner_id || u.id === currentUser?.id);
@@ -268,7 +359,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       created_at: new Date().toISOString(),
     };
 
-    // Save to Supabase if configured
     if (isSupabaseConfigured && supabase) {
       try {
         await supabase.from('servers').insert({
@@ -317,7 +407,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     }
 
-    // Save to global registry for cross-tab local sharing
     const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
     localStorage.setItem(GLOBAL_SERVERS_REGISTRY, JSON.stringify([...globalServers.filter(s => s.id !== newServer.id), newServer]));
 
@@ -333,7 +422,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setActiveServerId(newServerId);
     setActiveChannelId(defaultTextChannel.id);
 
-    // Broadcast creation
     if (typeof window !== 'undefined') {
       const bc = new BroadcastChannel('nexus_server_events');
       bc.postMessage({
@@ -352,7 +440,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!currentUser) return false;
     const cleanCode = inviteCode.trim().toLowerCase().replace(/^https?:\/\/.*\/join\//, '');
 
-    // 1. Try Supabase lookup
     if (isSupabaseConfigured && supabase) {
       try {
         const { data: server, error } = await supabase
@@ -362,14 +449,12 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           .single();
 
         if (server && !error) {
-          // Add to server_members in Supabase
           await supabase.from('server_members').upsert({
             server_id: server.id,
             user_id: currentUser.id,
             role: 'member',
           });
 
-          // Fetch categories & channels for this server
           const { data: serverCats } = await supabase
             .from('categories')
             .select('*')
@@ -402,7 +487,6 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     }
 
-    // 2. Lookup in global registry / local storage
     const globalServers: Server[] = JSON.parse(localStorage.getItem(GLOBAL_SERVERS_REGISTRY) || '[]');
     const allKnown = [...servers, ...globalServers];
     const serverToJoin = allKnown.find(s => 
@@ -575,6 +659,7 @@ export const ServerProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     setAllMessages(prev => {
       const list = prev[activeChannelId] || [];
+      if (list.some(m => m.id === newMsg.id)) return prev;
       return { ...prev, [activeChannelId]: [...list, newMsg] };
     });
 

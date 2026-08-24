@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import type { Friendship, DirectMessage, UserProfile, MessageAttachment } from '../types';
+import type { DirectMessage, UserProfile, MessageAttachment } from '../types';
 import { useAuth } from './AuthContext';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { sounds } from '../lib/sounds';
@@ -29,7 +29,6 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [activeDmUserId, setActiveDmUserId] = useState<string | null>(null);
   const [unreadDmCounts, setUnreadDmCounts] = useState<Record<string, number>>({});
 
-  // Everyone is friend with everyone
   const friends: UserProfile[] = currentUser
     ? allUsers.filter(u => u.id !== currentUser.id)
     : [];
@@ -38,42 +37,127 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     localStorage.setItem('nexus_user_direct_messages', JSON.stringify(directMessages));
   }, [directMessages]);
 
-  // Load direct messages from Supabase if configured
+  // 1. Fetch DMs from Supabase when activeDmUserId changes
   useEffect(() => {
-    async function loadSupabaseDMs() {
-      if (isSupabaseConfigured && supabase && currentUser) {
+    async function loadDmHistory() {
+      if (!activeDmUserId || !currentUser) return;
+
+      if (isSupabaseConfigured && supabase) {
         try {
-          const { data: dms } = await supabase
+          const { data: dms, error } = await supabase
             .from('direct_messages')
             .select('*')
-            .or(`sender_id.eq.${currentUser.id},receiver_id.eq.${currentUser.id}`);
+            .or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${activeDmUserId}),and(sender_id.eq.${activeDmUserId},receiver_id.eq.${currentUser.id})`)
+            .order('created_at', { ascending: true });
 
-          if (dms && dms.length > 0) {
-            const grouped: Record<string, DirectMessage[]> = {};
-            dms.forEach(dm => {
-              const partnerId = dm.sender_id === currentUser.id ? dm.receiver_id : dm.sender_id;
-              const sender = allUsers.find(u => u.id === dm.sender_id) || currentUser;
-              const receiver = allUsers.find(u => u.id === dm.receiver_id) || currentUser;
+          if (dms && !error) {
+            const formatted: DirectMessage[] = dms.map(dm => {
+              const sender = allUsers.find(u => u.id === dm.sender_id) || (dm.sender_id === currentUser.id ? currentUser : {
+                id: dm.sender_id,
+                username: 'usuario',
+                display_name: 'Usuário',
+                avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${dm.sender_id}`,
+                presence_status: 'online',
+                created_at: dm.created_at,
+              });
 
-              const formatted: DirectMessage = {
+              const receiver = allUsers.find(u => u.id === dm.receiver_id) || (dm.receiver_id === currentUser.id ? currentUser : {
+                id: dm.receiver_id,
+                username: 'usuario',
+                display_name: 'Usuário',
+                avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${dm.receiver_id}`,
+                presence_status: 'online',
+                created_at: dm.created_at,
+              });
+
+              return {
                 ...dm,
                 sender,
                 receiver,
               };
-
-              if (!grouped[partnerId]) grouped[partnerId] = [];
-              grouped[partnerId].push(formatted);
             });
-            setDirectMessages(prev => ({ ...prev, ...grouped }));
+
+            setDirectMessages(prev => ({
+              ...prev,
+              [activeDmUserId]: formatted
+            }));
           }
         } catch (err) {
-          console.error('Error fetching Supabase DMs:', err);
+          console.error('Error fetching Supabase DMs history:', err);
         }
       }
     }
 
-    loadSupabaseDMs();
-  }, [currentUser, allUsers]);
+    loadDmHistory();
+  }, [activeDmUserId, currentUser, allUsers]);
+
+  // 2. Supabase Realtime Subscription for DMs
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase || !currentUser) return;
+
+    const dmSubscription = supabase
+      .channel('public:direct_messages')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'direct_messages' },
+        (payload) => {
+          const dm = payload.new;
+          if (dm.receiver_id === currentUser.id || dm.sender_id === currentUser.id) {
+            const partnerId = dm.sender_id === currentUser.id ? dm.receiver_id : dm.sender_id;
+            const sender = allUsers.find(u => u.id === dm.sender_id) || (dm.sender_id === currentUser.id ? currentUser : {
+              id: dm.sender_id,
+              username: 'usuario',
+              display_name: 'Usuário',
+              avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${dm.sender_id}`,
+              presence_status: 'online',
+              created_at: dm.created_at,
+            });
+
+            const receiver = allUsers.find(u => u.id === dm.receiver_id) || (dm.receiver_id === currentUser.id ? currentUser : {
+              id: dm.receiver_id,
+              username: 'usuario',
+              display_name: 'Usuário',
+              avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${dm.receiver_id}`,
+              presence_status: 'online',
+              created_at: dm.created_at,
+            });
+
+            const fullDm: DirectMessage = {
+              id: dm.id,
+              sender_id: dm.sender_id,
+              receiver_id: dm.receiver_id,
+              content: dm.content,
+              attachments: dm.attachments || [],
+              reactions: dm.reactions || [],
+              is_edited: dm.is_edited || false,
+              created_at: dm.created_at,
+              sender,
+              receiver,
+            };
+
+            setDirectMessages(prev => {
+              const list = prev[partnerId] || [];
+              if (list.some(m => m.id === fullDm.id)) return prev;
+              return { ...prev, [partnerId]: [...list, fullDm] };
+            });
+
+            if (dm.sender_id !== currentUser.id) {
+              sounds.playMessage();
+              if (activeDmUserId !== partnerId) {
+                setUnreadDmCounts(prev => ({ ...prev, [partnerId]: (prev[partnerId] || 0) + 1 }));
+              }
+            }
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      if (supabase) {
+        supabase.removeChannel(dmSubscription);
+      }
+    };
+  }, [activeDmUserId, currentUser, allUsers]);
 
   // Realtime BroadcastChannel for cross-tab DMs
   useEffect(() => {

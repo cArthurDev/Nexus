@@ -1,14 +1,16 @@
 import React, { useRef, useEffect } from 'react';
 import { useFriend } from '../../contexts/FriendContext';
 import { useVoice } from '../../contexts/VoiceContext';
+import { useServer } from '../../contexts/ServerContext';
 import { useAuth } from '../../contexts/AuthContext';
 import { Avatar } from '../ui/Avatar';
 import { MessageInput } from '../chat/MessageInput';
-import { Phone, Video, MoreVertical, MessageSquare } from 'lucide-react';
+import { Phone, Video, MessageSquare, Compass, ArrowRight } from 'lucide-react';
 import { useToast } from '../ui/Toast';
 
 export const DirectChatArea: React.FC = () => {
   const { activeDmUser, currentDmMessages, sendDirectMessage } = useFriend();
+  const { joinServerByInvite } = useServer();
   const { joinVoiceChannel, toggleCamera } = useVoice();
   const { currentUser } = useAuth();
   const { showToast } = useToast();
@@ -45,8 +47,23 @@ export const DirectChatArea: React.FC = () => {
     showToast('info', 'Iniciando Chamada com Vídeo...', `Chamando @${activeDmUser.username}`);
   };
 
+  const handleAcceptInvite = async (code: string) => {
+    const success = await joinServerByInvite(code);
+    if (success) {
+      showToast('success', 'Convite Aceito!', 'Você entrou no servidor com sucesso.');
+    } else {
+      showToast('error', 'Erro', 'Não foi possível entrar no servidor. Verifique se o código ainda é válido.');
+    }
+  };
+
   const formatTime = (iso: string) => {
     return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
+  // Helper to extract invite code from text
+  const extractInviteCode = (text: string) => {
+    const match = text.match(/nexus-[a-zA-Z0-9]+/i);
+    return match ? match[0] : null;
   };
 
   return (
@@ -74,7 +91,7 @@ export const DirectChatArea: React.FC = () => {
         <div className="flex items-center gap-2 text-slate-300">
           <button
             onClick={handleStartAudioCall}
-            className="p-2 rounded-xl bg-nexus-900 hover:bg-nexus-850 hover:text-emerald-400 transition-colors"
+            className="p-2.5 rounded-xl bg-nexus-900 hover:bg-nexus-850 hover:text-emerald-400 transition-colors shadow"
             title="Iniciar Chamada de Voz"
           >
             <Phone className="w-4 h-4" />
@@ -82,7 +99,7 @@ export const DirectChatArea: React.FC = () => {
 
           <button
             onClick={handleStartVideoCall}
-            className="p-2 rounded-xl bg-nexus-900 hover:bg-nexus-850 hover:text-nexus-accent transition-colors"
+            className="p-2.5 rounded-xl bg-nexus-900 hover:bg-nexus-850 hover:text-nexus-accent transition-colors shadow"
             title="Iniciar Vídeo Chamada"
           >
             <Video className="w-4 h-4" />
@@ -109,13 +126,15 @@ export const DirectChatArea: React.FC = () => {
             </p>
           )}
           <p className="text-[11px] text-slate-500 mt-3">
-            Este é o começo do seu histórico de mensagens diretas com <strong>{activeDmUser.display_name}</strong>.
+            Início das mensagens diretas com <strong>{activeDmUser.display_name}</strong>.
           </p>
         </div>
 
         {/* Message Items */}
         {currentDmMessages.map((dm) => {
           const isMine = dm.sender_id === currentUser?.id;
+          const inviteCode = extractInviteCode(dm.content);
+
           return (
             <div key={dm.id} className={`flex items-start gap-3 ${isMine ? 'flex-row-reverse' : ''}`}>
               <Avatar
@@ -134,13 +153,40 @@ export const DirectChatArea: React.FC = () => {
                   </span>
                 </div>
                 <div
-                  className={`p-3 rounded-2xl text-xs leading-relaxed ${
+                  className={`p-3.5 rounded-2xl text-xs leading-relaxed ${
                     isMine
-                      ? 'bg-nexus-accent text-nexus-950 font-medium rounded-tr-sm'
-                      : 'bg-nexus-850 text-slate-200 rounded-tl-sm border border-white/5'
+                      ? 'bg-nexus-accent text-nexus-950 font-medium rounded-tr-sm shadow-md'
+                      : 'bg-nexus-850 text-slate-200 rounded-tl-sm border border-white/5 shadow-md'
                   }`}
                 >
                   <p className="whitespace-pre-wrap break-words">{dm.content}</p>
+
+                  {/* Interactive Server Invite Card */}
+                  {inviteCode && (
+                    <div className="mt-3 p-3 rounded-xl bg-nexus-950/90 border border-nexus-accent/30 flex items-center justify-between gap-3 text-slate-200">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="w-8 h-8 rounded-lg bg-nexus-accent/20 text-nexus-accent flex items-center justify-center shrink-0">
+                          <Compass className="w-4 h-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <span className="font-bold text-xs text-white block truncate">
+                            Convite de Servidor
+                          </span>
+                          <span className="text-[10px] text-slate-400 font-mono">
+                            {inviteCode}
+                          </span>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => handleAcceptInvite(inviteCode)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white font-bold text-xs rounded-lg transition-colors shadow shrink-0"
+                      >
+                        <span>Entrar</span>
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
 
                   {dm.attachments && dm.attachments.length > 0 && (
                     <div className="mt-2 space-y-1.5">
