@@ -1,20 +1,17 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import type { Friendship, DirectMessage, UserProfile, MessageAttachment } from '../types';
 import { useAuth } from './AuthContext';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { sounds } from '../lib/sounds';
 
 interface FriendContextType {
-  friendships: Friendship[];
+  friends: UserProfile[];
   directMessages: Record<string, DirectMessage[]>;
   activeDmUserId: string | null;
   activeDmUser: UserProfile | null;
   currentDmMessages: DirectMessage[];
   unreadDmCounts: Record<string, number>;
   setActiveDmUserId: (userId: string | null) => void;
-  sendFriendRequest: (username: string) => Promise<{ success: boolean; message: string }>;
-  acceptFriendRequest: (friendshipId: string) => Promise<void>;
-  rejectFriendRequest: (friendshipId: string) => Promise<void>;
-  removeFriend: (friendshipId: string) => Promise<void>;
   sendDirectMessage: (receiverId: string, content: string, attachments?: MessageAttachment[]) => Promise<void>;
   deleteDirectMessage: (partnerId: string, messageId: string) => Promise<void>;
 }
@@ -24,11 +21,6 @@ const FriendContext = createContext<FriendContextType | undefined>(undefined);
 export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { currentUser, allUsers } = useAuth();
 
-  const [friendships, setFriendships] = useState<Friendship[]>(() => {
-    const saved = localStorage.getItem('nexus_user_friendships');
-    return saved ? JSON.parse(saved) : [];
-  });
-
   const [directMessages, setDirectMessages] = useState<Record<string, DirectMessage[]>>(() => {
     const saved = localStorage.getItem('nexus_user_direct_messages');
     return saved ? JSON.parse(saved) : {};
@@ -37,71 +29,86 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [activeDmUserId, setActiveDmUserId] = useState<string | null>(null);
   const [unreadDmCounts, setUnreadDmCounts] = useState<Record<string, number>>({});
 
-  useEffect(() => {
-    localStorage.setItem('nexus_user_friendships', JSON.stringify(friendships));
-  }, [friendships]);
+  // Everyone is friend with everyone
+  const friends: UserProfile[] = currentUser
+    ? allUsers.filter(u => u.id !== currentUser.id)
+    : [];
 
   useEffect(() => {
     localStorage.setItem('nexus_user_direct_messages', JSON.stringify(directMessages));
   }, [directMessages]);
 
-  const activeDmUser = allUsers.find(u => u.id === activeDmUserId) || null;
-  const currentDmMessages = activeDmUserId ? (directMessages[activeDmUserId] || []) : [];
+  // Load direct messages from Supabase if configured
+  useEffect(() => {
+    async function loadSupabaseDMs() {
+      if (isSupabaseConfigured && supabase && currentUser) {
+        try {
+          const { data: dms } = await supabase
+            .from('direct_messages')
+            .select('*')
+            .or(`sender_id.eq.${currentUser.id},receiver_id.eq.${currentUser.id}`);
 
-  const sendFriendRequest = async (username: string): Promise<{ success: boolean; message: string }> => {
-    const cleanUsername = username.trim().toLowerCase().replace(/^@/, '');
-    if (!currentUser) return { success: false, message: 'Usuário não autenticado.' };
-    if (cleanUsername === currentUser.username.toLowerCase()) {
-      return { success: false, message: 'Você não pode adicionar a si mesmo como amigo.' };
-    }
+          if (dms && dms.length > 0) {
+            const grouped: Record<string, DirectMessage[]> = {};
+            dms.forEach(dm => {
+              const partnerId = dm.sender_id === currentUser.id ? dm.receiver_id : dm.sender_id;
+              const sender = allUsers.find(u => u.id === dm.sender_id) || currentUser;
+              const receiver = allUsers.find(u => u.id === dm.receiver_id) || currentUser;
 
-    let targetUser = allUsers.find(u => u.username.toLowerCase() === cleanUsername);
-    if (!targetUser) {
-      // Create user entry dynamically if not existing
-      targetUser = {
-        id: `usr_${cleanUsername}`,
-        username: cleanUsername,
-        display_name: cleanUsername,
-        avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
-        presence_status: 'online',
-        created_at: new Date().toISOString()
-      };
-    }
+              const formatted: DirectMessage = {
+                ...dm,
+                sender,
+                receiver,
+              };
 
-    const alreadyFriend = friendships.find(f => f.friend.id === targetUser.id);
-    if (alreadyFriend) {
-      if (alreadyFriend.status === 'ACCEPTED') {
-        return { success: false, message: `Você já é amigo de @${targetUser.username}.` };
+              if (!grouped[partnerId]) grouped[partnerId] = [];
+              grouped[partnerId].push(formatted);
+            });
+            setDirectMessages(prev => ({ ...prev, ...grouped }));
+          }
+        } catch (err) {
+          console.error('Error fetching Supabase DMs:', err);
+        }
       }
-      return { success: false, message: `Já existe uma solicitação pendente com @${targetUser.username}.` };
     }
 
-    const newFriendship: Friendship = {
-      id: `fr_${Date.now()}`,
-      user_id_1: currentUser.id,
-      user_id_2: targetUser.id,
-      status: 'PENDING',
-      created_at: new Date().toISOString(),
-      friend: targetUser,
+    loadSupabaseDMs();
+  }, [currentUser, allUsers]);
+
+  // Realtime BroadcastChannel for cross-tab DMs
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const bc = new BroadcastChannel('nexus_dm_events');
+
+    bc.onmessage = (event) => {
+      const data = event.data;
+      if (data.type === 'NEW_DM') {
+        const dm: DirectMessage = data.dm;
+        if (currentUser && (dm.receiver_id === currentUser.id || dm.sender_id === currentUser.id)) {
+          const partnerId = dm.sender_id === currentUser.id ? dm.receiver_id : dm.sender_id;
+          setDirectMessages(prev => {
+            const list = prev[partnerId] || [];
+            if (list.some(m => m.id === dm.id)) return prev;
+            return { ...prev, [partnerId]: [...list, dm] };
+          });
+
+          if (dm.sender_id !== currentUser.id) {
+            sounds.playMessage();
+            if (activeDmUserId !== partnerId) {
+              setUnreadDmCounts(prev => ({ ...prev, [partnerId]: (prev[partnerId] || 0) + 1 }));
+            }
+          }
+        }
+      }
     };
 
-    setFriendships(prev => [...prev, newFriendship]);
-    sounds.playPop();
-    return { success: true, message: `Solicitação de amizade enviada para @${targetUser.username}!` };
-  };
+    return () => {
+      bc.close();
+    };
+  }, [activeDmUserId, currentUser]);
 
-  const acceptFriendRequest = async (friendshipId: string) => {
-    setFriendships(prev => prev.map(f => f.id === friendshipId ? { ...f, status: 'ACCEPTED' as const } : f));
-    sounds.playPop();
-  };
-
-  const rejectFriendRequest = async (friendshipId: string) => {
-    setFriendships(prev => prev.filter(f => f.id !== friendshipId));
-  };
-
-  const removeFriend = async (friendshipId: string) => {
-    setFriendships(prev => prev.filter(f => f.id !== friendshipId));
-  };
+  const activeDmUser = allUsers.find(u => u.id === activeDmUserId) || null;
+  const currentDmMessages = activeDmUserId ? (directMessages[activeDmUserId] || []) : [];
 
   const sendDirectMessage = async (receiverId: string, content: string, attachments?: MessageAttachment[]) => {
     if (!currentUser) return;
@@ -109,10 +116,15 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     let receiver = allUsers.find(u => u.id === receiverId);
     if (!receiver) {
-      const friendObj = friendships.find(f => f.friend.id === receiverId)?.friend;
-      receiver = friendObj;
+      receiver = {
+        id: receiverId,
+        username: 'usuario',
+        display_name: 'Usuário',
+        avatar_url: `https://api.dicebear.com/7.x/bottts/svg?seed=${receiverId}`,
+        presence_status: 'online',
+        created_at: new Date().toISOString()
+      };
     }
-    if (!receiver) return;
 
     const newDm: DirectMessage = {
       id: `dm_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -127,6 +139,17 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       receiver,
     };
 
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('direct_messages').insert({
+        id: newDm.id,
+        sender_id: currentUser.id,
+        receiver_id: receiverId,
+        content: newDm.content,
+        attachments: newDm.attachments,
+        reactions: newDm.reactions,
+      });
+    }
+
     setDirectMessages(prev => {
       const chat = prev[receiverId] || [];
       return { ...prev, [receiverId]: [...chat, newDm] };
@@ -134,9 +157,18 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     sounds.playPop();
     setUnreadDmCounts(prev => ({ ...prev, [receiverId]: 0 }));
+
+    if (typeof window !== 'undefined') {
+      const bc = new BroadcastChannel('nexus_dm_events');
+      bc.postMessage({ type: 'NEW_DM', dm: newDm });
+      bc.close();
+    }
   };
 
   const deleteDirectMessage = async (partnerId: string, messageId: string) => {
+    if (isSupabaseConfigured && supabase) {
+      await supabase.from('direct_messages').delete().eq('id', messageId);
+    }
     setDirectMessages(prev => {
       const list = prev[partnerId] || [];
       return {
@@ -149,17 +181,13 @@ export const FriendProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   return (
     <FriendContext.Provider
       value={{
-        friendships,
+        friends,
         directMessages,
         activeDmUserId,
         activeDmUser,
         currentDmMessages,
         unreadDmCounts,
         setActiveDmUserId,
-        sendFriendRequest,
-        acceptFriendRequest,
-        rejectFriendRequest,
-        removeFriend,
         sendDirectMessage,
         deleteDirectMessage,
       }}

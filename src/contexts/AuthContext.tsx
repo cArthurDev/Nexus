@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { UserProfile } from '../types';
+import type { UserProfile } from '../types';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 interface AuthContextType {
@@ -29,7 +29,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        // If it's a valid saved user, return it
         if (parsed && parsed.id && !parsed.id.startsWith('usr_me_01')) {
           return parsed;
         }
@@ -42,6 +41,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
+  // Sync users list to localStorage
   useEffect(() => {
     localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(allUsers));
   }, [allUsers]);
@@ -54,6 +54,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [currentUser]);
 
+  // Supabase Auth and Profiles Realtime Sync
   useEffect(() => {
     async function initAuth() {
       if (isSupabaseConfigured && supabase) {
@@ -70,6 +71,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               setCurrentUser(profile);
             }
           }
+
+          // Fetch all user profiles from Supabase so all users see each other
+          const { data: profiles } = await supabase
+            .from('profiles')
+            .select('*');
+
+          if (profiles && profiles.length > 0) {
+            setAllUsers(profiles);
+          }
         } catch (err) {
           console.error('Supabase auth initialization error', err);
         }
@@ -78,6 +88,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     initAuth();
+  }, []);
+
+  // BroadcastChannel for local cross-tab users sync
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const bc = new BroadcastChannel('nexus_users_channel');
+
+    bc.onmessage = (e) => {
+      const data = e.data;
+      if (data.type === 'USER_JOINED' || data.type === 'USER_UPDATED') {
+        const user: UserProfile = data.user;
+        setAllUsers(prev => {
+          const filtered = prev.filter(u => u.id !== user.id && u.username !== user.username);
+          return [...filtered, user];
+        });
+      }
+    };
+
+    return () => {
+      bc.close();
+    };
   }, []);
 
   const login = async (emailOrUsername: string, password?: string): Promise<boolean> => {
@@ -104,7 +135,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setIsLoading(false);
       return true;
     } else {
-      // Local/demo auth
+      // Local auth
       const user = allUsers.find(
         u => u.username.toLowerCase() === cleanInput || u.id === cleanInput
       );
@@ -116,7 +147,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsLoading(false);
         return true;
       } else {
-        // Automatically create account if first time logging in with this username
         const newUser: UserProfile = {
           id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           username: cleanInput.replace(/[^a-z0-9_]/g, '') || 'usuario',
@@ -128,6 +158,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
         setCurrentUser(newUser);
         setAllUsers(prev => [...prev, newUser]);
+
+        if (typeof window !== 'undefined') {
+          const bc = new BroadcastChannel('nexus_users_channel');
+          bc.postMessage({ type: 'USER_JOINED', user: newUser });
+          bc.close();
+        }
+
         setIsLoading(false);
         return true;
       }
@@ -164,11 +201,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           created_at: new Date().toISOString(),
         };
         setCurrentUser(newProfile);
+        setAllUsers(prev => [...prev.filter(u => u.id !== newProfile.id), newProfile]);
       }
       setIsLoading(false);
       return true;
     } else {
-      // Local signup
       const newUser: UserProfile = {
         id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         username: cleanUsername,
@@ -180,6 +217,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
       setCurrentUser(newUser);
       setAllUsers(prev => [...prev.filter(u => u.username !== cleanUsername), newUser]);
+
+      if (typeof window !== 'undefined') {
+        const bc = new BroadcastChannel('nexus_users_channel');
+        bc.postMessage({ type: 'USER_JOINED', user: newUser });
+        bc.close();
+      }
+
       setIsLoading(false);
       return true;
     }
@@ -204,6 +248,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         .from('profiles')
         .update(updates)
         .eq('id', currentUser.id);
+    }
+
+    if (typeof window !== 'undefined') {
+      const bc = new BroadcastChannel('nexus_users_channel');
+      bc.postMessage({ type: 'USER_UPDATED', user: updated });
+      bc.close();
     }
   };
 
