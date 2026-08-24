@@ -57,6 +57,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const [remoteParticipants, setRemoteParticipants] = useState<VoiceParticipant[]>([]);
 
+  const localStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -65,6 +66,11 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const remoteAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+
+  // Keep localStreamRef synced
+  useEffect(() => {
+    localStreamRef.current = localStream;
+  }, [localStream]);
 
   const setupAudioDetection = useCallback((stream: MediaStream) => {
     try {
@@ -130,7 +136,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, []);
 
   // WebRTC Peer Connection Helper
-  const createPeerConnection = useCallback((remoteUserId: string, stream: MediaStream | null, channel: any) => {
+  const createPeerConnection = useCallback((remoteUserId: string, channel: any) => {
     if (peerConnectionsRef.current.has(remoteUserId)) {
       return peerConnectionsRef.current.get(remoteUserId)!;
     }
@@ -138,10 +144,11 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const pc = new RTCPeerConnection(RTC_CONFIG);
     peerConnectionsRef.current.set(remoteUserId, pc);
 
-    // Add local tracks
-    if (stream) {
-      stream.getTracks().forEach(track => {
-        pc.addTrack(track, stream);
+    // Add local tracks from stream ref
+    const currentStream = localStreamRef.current;
+    if (currentStream) {
+      currentStream.getTracks().forEach(track => {
+        pc.addTrack(track, currentStream);
       });
     }
 
@@ -198,176 +205,173 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return pc;
   }, [currentUser]);
 
-  // Supabase Presence & WebRTC Signaling Channel
+  // Supabase Presence & WebRTC Signaling Channel (runs ONLY when activeVoiceChannelId or currentUser.id changes)
   useEffect(() => {
-    if (!activeVoiceChannelId || !currentUser) return;
+    if (!activeVoiceChannelId || !currentUser || !isSupabaseConfigured || !supabase) return;
 
-    if (isSupabaseConfigured && supabase) {
-      const channel = supabase.channel(`voice_room:${activeVoiceChannelId}`, {
-        config: {
-          presence: {
-            key: currentUser.id,
-          },
+    // Unique channel identifier
+    const channelName = `voice_room_${activeVoiceChannelId}`;
+    const channel = supabase.channel(channelName, {
+      config: {
+        presence: {
+          key: currentUser.id,
         },
-      });
+      },
+    });
 
-      realtimeChannelRef.current = channel;
+    realtimeChannelRef.current = channel;
 
-      // Handle Signaling Messages (Offer, Answer, ICE)
-      channel
-        .on('broadcast', { event: 'WEBRTC_OFFER' }, async (payload: any) => {
-          const { from, to, offer } = payload.payload;
-          if (to === currentUser.id && from) {
-            const pc = createPeerConnection(from, localStream, channel);
-            await pc.setRemoteDescription(new RTCSessionDescription(offer));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+    // 1. Attach ALL callbacks BEFORE calling subscribe()
+    channel
+      .on('broadcast', { event: 'WEBRTC_OFFER' }, async (payload: any) => {
+        const { from, to, offer } = payload.payload;
+        if (to === currentUser.id && from) {
+          const pc = createPeerConnection(from, channel);
+          await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          channel.send({
+            type: 'broadcast',
+            event: 'WEBRTC_ANSWER',
+            payload: {
+              from: currentUser.id,
+              to: from,
+              answer,
+            },
+          });
+        }
+      })
+      .on('broadcast', { event: 'WEBRTC_ANSWER' }, async (payload: any) => {
+        const { from, to, answer } = payload.payload;
+        if (to === currentUser.id && from) {
+          const pc = peerConnectionsRef.current.get(from);
+          if (pc && pc.signalingState !== 'stable') {
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          }
+        }
+      })
+      .on('broadcast', { event: 'WEBRTC_ICE' }, async (payload: any) => {
+        const { from, to, candidate } = payload.payload;
+        if (to === currentUser.id && from && candidate) {
+          const pc = peerConnectionsRef.current.get(from);
+          if (pc) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (e) {
+              console.warn('Error adding ICE Candidate', e);
+            }
+          }
+        }
+      })
+      .on('presence', { event: 'sync' }, async () => {
+        const state = channel.presenceState();
+        const remotes: VoiceParticipant[] = [];
+
+        Object.keys(state).forEach((key) => {
+          if (key !== currentUser.id) {
+            const presenceList = state[key] as any[];
+            if (presenceList && presenceList.length > 0) {
+              const latest = presenceList[presenceList.length - 1];
+              remotes.push(latest.participant);
+            }
+          }
+        });
+
+        setRemoteParticipants(remotes);
+
+        // Initiate WebRTC Offer if our ID is smaller
+        for (const remote of remotes) {
+          if (currentUser.id < remote.user_id && !peerConnectionsRef.current.has(remote.user_id)) {
+            const pc = createPeerConnection(remote.user_id, channel);
+            const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+            await pc.setLocalDescription(offer);
 
             channel.send({
               type: 'broadcast',
-              event: 'WEBRTC_ANSWER',
+              event: 'WEBRTC_OFFER',
               payload: {
                 from: currentUser.id,
-                to: from,
-                answer,
+                to: remote.user_id,
+                offer,
               },
             });
           }
-        })
-        .on('broadcast', { event: 'WEBRTC_ANSWER' }, async (payload: any) => {
-          const { from, to, answer } = payload.payload;
-          if (to === currentUser.id && from) {
-            const pc = peerConnectionsRef.current.get(from);
-            if (pc && pc.signalingState !== 'stable') {
-              await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            }
-          }
-        })
-        .on('broadcast', { event: 'WEBRTC_ICE' }, async (payload: any) => {
-          const { from, to, candidate } = payload.payload;
-          if (to === currentUser.id && from && candidate) {
-            const pc = peerConnectionsRef.current.get(from);
-            if (pc) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-              } catch (e) {
-                console.warn('Error adding ICE Candidate', e);
-              }
-            }
-          }
-        });
-
-      // Presence Sync & Trigger Calls
-      channel
-        .on('presence', { event: 'sync' }, async () => {
-          const state = channel.presenceState();
-          const remotes: VoiceParticipant[] = [];
-
-          Object.keys(state).forEach((key) => {
-            if (key !== currentUser.id) {
-              const presenceList = state[key] as any[];
-              if (presenceList && presenceList.length > 0) {
-                const latest = presenceList[presenceList.length - 1];
-                remotes.push(latest.participant);
-              }
-            }
+        }
+      })
+      .on('presence', { event: 'join' }, async ({ key, newPresences }) => {
+        if (key !== currentUser.id && newPresences.length > 0) {
+          const p = (newPresences[0] as any).participant;
+          setRemoteParticipants(prev => {
+            if (prev.some(item => item.user_id === p.user_id)) return prev;
+            return [...prev, p];
           });
+          sounds.playJoinVoice();
 
-          setRemoteParticipants(remotes);
+          if (currentUser.id < p.user_id && !peerConnectionsRef.current.has(p.user_id)) {
+            const pc = createPeerConnection(p.user_id, channel);
+            const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+            await pc.setLocalDescription(offer);
 
-          // Initiate WebRTC Offer to all remote peers if our ID is alphabetically smaller
-          for (const remote of remotes) {
-            if (currentUser.id < remote.user_id && !peerConnectionsRef.current.has(remote.user_id)) {
-              const pc = createPeerConnection(remote.user_id, localStream, channel);
-              const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-              await pc.setLocalDescription(offer);
-
-              channel.send({
-                type: 'broadcast',
-                event: 'WEBRTC_OFFER',
-                payload: {
-                  from: currentUser.id,
-                  to: remote.user_id,
-                  offer,
-                },
-              });
-            }
-          }
-        })
-        .on('presence', { event: 'join' }, async ({ key, newPresences }) => {
-          if (key !== currentUser.id && newPresences.length > 0) {
-            const p = (newPresences[0] as any).participant;
-            setRemoteParticipants(prev => {
-              if (prev.some(item => item.user_id === p.user_id)) return prev;
-              return [...prev, p];
-            });
-            sounds.playJoinVoice();
-
-            // Initiate offer
-            if (currentUser.id < p.user_id && !peerConnectionsRef.current.has(p.user_id)) {
-              const pc = createPeerConnection(p.user_id, localStream, channel);
-              const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-              await pc.setLocalDescription(offer);
-
-              channel.send({
-                type: 'broadcast',
-                event: 'WEBRTC_OFFER',
-                payload: {
-                  from: currentUser.id,
-                  to: p.user_id,
-                  offer,
-                },
-              });
-            }
-          }
-        })
-        .on('presence', { event: 'leave' }, ({ key }) => {
-          if (key !== currentUser.id) {
-            setRemoteParticipants(prev => prev.filter(p => p.user_id !== key));
-            sounds.playLeaveVoice();
-
-            const pc = peerConnectionsRef.current.get(key);
-            if (pc) {
-              pc.close();
-              peerConnectionsRef.current.delete(key);
-            }
-            const audioEl = remoteAudioElementsRef.current.get(key);
-            if (audioEl) {
-              audioEl.srcObject = null;
-              remoteAudioElementsRef.current.delete(key);
-            }
-          }
-        })
-        .subscribe(async (status) => {
-          if (status === 'SUBSCRIBED') {
-            await channel.track({
-              participant: {
-                id: `vp_${currentUser.id}`,
-                user_id: currentUser.id,
-                channel_id: activeVoiceChannelId,
-                is_muted: isMuted,
-                is_deafened: isDeafened,
-                is_speaking: isSpeaking,
-                is_camera_on: isCameraOn,
-                is_screen_sharing: isScreenSharing,
-                audio_level: isSpeaking ? 80 : 0,
-                joined_at: new Date().toISOString(),
-                profile: currentUser,
+            channel.send({
+              type: 'broadcast',
+              event: 'WEBRTC_OFFER',
+              payload: {
+                from: currentUser.id,
+                to: p.user_id,
+                offer,
               },
             });
           }
-        });
+        }
+      })
+      .on('presence', { event: 'leave' }, ({ key }) => {
+        if (key !== currentUser.id) {
+          setRemoteParticipants(prev => prev.filter(p => p.user_id !== key));
+          sounds.playLeaveVoice();
 
-      return () => {
-        channel.untrack().then(() => {
-          if (supabase) {
-            supabase.removeChannel(channel);
+          const pc = peerConnectionsRef.current.get(key);
+          if (pc) {
+            pc.close();
+            peerConnectionsRef.current.delete(key);
           }
+          const audioEl = remoteAudioElementsRef.current.get(key);
+          if (audioEl) {
+            audioEl.srcObject = null;
+            remoteAudioElementsRef.current.delete(key);
+          }
+        }
+      });
+
+    // 2. Subscribe once
+    channel.subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.track({
+          participant: {
+            id: `vp_${currentUser.id}`,
+            user_id: currentUser.id,
+            channel_id: activeVoiceChannelId,
+            is_muted: isMuted,
+            is_deafened: isDeafened,
+            is_speaking: isSpeaking,
+            is_camera_on: isCameraOn,
+            is_screen_sharing: isScreenSharing,
+            audio_level: isSpeaking ? 80 : 0,
+            joined_at: new Date().toISOString(),
+            profile: currentUser,
+          },
         });
-        realtimeChannelRef.current = null;
-      };
-    }
-  }, [activeVoiceChannelId, currentUser, localStream, createPeerConnection]);
+      }
+    });
+
+    return () => {
+      channel.untrack().catch(() => {});
+      if (supabase) {
+        supabase.removeChannel(channel);
+      }
+      realtimeChannelRef.current = null;
+    };
+  }, [activeVoiceChannelId, currentUser?.id, createPeerConnection]);
 
   // Update presence state when local mic/cam/screen changes
   useEffect(() => {
@@ -386,7 +390,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           joined_at: new Date().toISOString(),
           profile: currentUser,
         },
-      });
+      }).catch(() => {});
     }
   }, [isMuted, isDeafened, isSpeaking, isCameraOn, isScreenSharing, currentUser, activeVoiceChannelId]);
 
@@ -413,6 +417,13 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
       setLocalStream(stream);
       setupAudioDetection(stream);
+
+      // Add audio tracks to existing peer connections
+      peerConnectionsRef.current.forEach(pc => {
+        stream.getTracks().forEach(track => {
+          pc.addTrack(track, stream);
+        });
+      });
     } catch (err) {
       console.warn('Microphone access not available or denied', err);
     }
@@ -447,7 +458,7 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
 
     if (realtimeChannelRef.current) {
-      realtimeChannelRef.current.untrack();
+      realtimeChannelRef.current.untrack().catch(() => {});
     }
 
     setActiveVoiceChannelId(null);
@@ -523,7 +534,6 @@ export const VoiceProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const videoTrack = videoStream.getVideoTracks()[0];
         if (localStream && videoTrack) {
           localStream.addTrack(videoTrack);
-          // Add to all peer connections
           peerConnectionsRef.current.forEach(pc => {
             pc.addTrack(videoTrack, localStream);
           });
